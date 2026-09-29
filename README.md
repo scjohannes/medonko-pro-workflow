@@ -73,3 +73,7 @@ quarto render analyses/00_build_analysis_datasets.qmd
 ```
 
 Every figure is saved as both PNG and SVG in the corresponding `output/` directory.
+
+## License
+
+The code in this repository is released under the [MIT License](LICENSE). This applies to the code only; it grants no rights to the underlying patient data.
