@@ -1,0 +1,441 @@
+---
+title: "Item-Position Effect on Missingness"
+author: "Johannes Schwenke"
+date: today
+format:
+  typst: default
+---
+
+## Overview
+
+This document examines whether items appearing later in a questionnaire are more likely to be missing. The analysis is purely descriptive. We fit an item-level logistic regression with restricted cubic splines for item position, interacted with form type (long vs short version), and use cluster-robust standard errors at the unique questionnaire-key level.
+
+```{r}
+#| label: setup
+library(here)
+library(arrow)
+library(Hmisc)
+library(rms)
+library(tidyverse)
+library(scales)
+library(tinytable)
+
+source(here("R", "io.R"))
+
+followup_limit_days <- 182L
+
+ensure_dir(here("output", "03c_position_effect"))
+ensure_dir(here("output", "03c_position_effect", "figures"))
+```
+
+```{r}
+#| label: load-data
+items <- read_parquet(here("output", "derived", "questionnaire_items_long.parquet")) |>
+  filter(
+    !is.na(days_since_first_contact),
+    days_since_first_contact >= 0,
+    days_since_first_contact <= followup_limit_days
+  ) |>
+  filter(!is_structural_absence) |>
+  mutate(
+    form_type = factor(form_type, levels = c("long_version", "short_version")),
+    form_type_label = factor(
+      form_type,
+      levels = c("long_version", "short_version"),
+      labels = c("EORTC QLQ-C30", "Adapted QLQ-C15-based form")
+    ),
+    pat_id = as.character(pat_id)
+  )
+```
+
+{{<pagebreak>}}
+
+## Observed Missingness by Item Position
+
+Before modelling, we summarise the raw item-level missingness rates by position within each form type.
+
+```{r}
+#| label: observed-rates
+observed_rates <- items |>
+  summarise(
+    n_items = n(),
+    n_missing = sum(is_missing_nonstructural),
+    missingness = mean(is_missing_nonstructural),
+    .by = c(form_type, form_type_label, item_position_within_form)
+  ) |>
+  arrange(form_type, item_position_within_form)
+
+write_parquet(observed_rates, here("output", "03c_position_effect", "observed_rates.parquet"))
+```
+
+```{r}
+#| label: tbl-observed-summary
+items |>
+  summarise(
+    `Items (eligible)` = n(),
+    Questionnaires = n_distinct(questionnaire_key),
+    Patients = n_distinct(pat_id),
+    `Overall missingness` = percent(mean(is_missing_nonstructural), accuracy = 0.1),
+    .by = form_type_label
+  ) |>
+  rename(`Form type` = form_type_label) |>
+  tt(caption = "Item-level summary by form type (structurally absent items excluded).")
+```
+
+```{r}
+#| label: fig-observed-rates
+#| fig-width: 10
+#| fig-height: 4
+observed_plot <- observed_rates |>
+  ggplot(aes(x = item_position_within_form, y = missingness)) +
+  geom_col(width = 0.7, fill = "grey40") +
+  facet_wrap(~ form_type_label, scales = "free_x") +
+  scale_x_continuous(
+    breaks = \(x) seq(5, ceiling(x[2] / 5) * 5, by = 5),
+    minor_breaks = NULL,
+    guide = guide_axis(check.overlap = TRUE)
+  ) +
+  scale_y_continuous(
+    labels = percent_format(accuracy = 1),
+    expand = expansion(mult = c(0, 0.05))
+  ) +
+  labs(
+    x = "Item number",
+    y = "Missingness rate"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(panel.grid.major.x = element_blank())
+
+save_plot_dual(observed_plot, here("output", "03c_position_effect", "figures", "observed_rates"), width = 10, height = 4)
+observed_plot
+```
+
+{{<pagebreak>}}
+
+## Model
+
+We fit a logistic regression at the item level. The outcome is `is_missing_nonstructural` (binary). Item position is modelled with restricted cubic splines ($k = 5$ knots) and interacted with form type, so each form type gets its own nonlinear missingness profile. Standard errors are cluster-robust at the unique questionnaire-key level.
+
+```{r}
+#| label: fit-model
+dd <- datadist(items)
+options(datadist = "dd")
+
+fit <- lrm(
+  is_missing_nonstructural ~ rcs(item_position_within_form, 5) * form_type,
+  data = items,
+  x = TRUE,
+  y = TRUE
+)
+
+fit <- robcov(fit, cluster = items$questionnaire_key)
+
+fit
+```
+
+```{r}
+#| label: model-anova
+fit_anova <- anova(fit)
+fit_anova
+```
+
+The ANOVA tests whether the position effect differs between form types (interaction), whether position has any effect at all (main effect), and the form-type main effect.
+
+```{r}
+#| label: fig-anova-importance
+#| fig-width: 6
+#| fig-height: 4
+plot(fit_anova)
+
+save_base_plot_dual(
+  function() plot(fit_anova),
+  here("output", "03c_position_effect", "figures", "anova_importance"),
+  width = 6, height = 4
+)
+```
+
+{{<pagebreak>}}
+
+## Predicted Probability of Missingness by Position
+
+Predicted probabilities with 95% Wald confidence intervals from the interaction model. The prediction grid for each form type covers only its actual range of positions (1-31 for the EORTC QLQ-C30, 1-18 for the adapted QLQ-C15-based follow-up form). All predictions are on the probability scale.
+
+```{r}
+#| label: predictions
+pred_long <- Predict(
+  fit,
+  item_position_within_form = 1:31,
+  form_type = "long_version",
+  fun = plogis
+)
+
+pred_short <- Predict(
+  fit,
+  item_position_within_form = 1:18,
+  form_type = "short_version",
+  fun = plogis
+)
+
+predictions <- bind_rows(
+  as_tibble(pred_long),
+  as_tibble(pred_short)
+) |>
+  mutate(
+    form_type_label = factor(
+      form_type,
+      levels = c("long_version", "short_version"),
+      labels = c("EORTC QLQ-C30", "Adapted QLQ-C15-based form")
+    )
+  )
+
+write_parquet(predictions, here("output", "03c_position_effect", "predictions.parquet"))
+```
+
+```{r}
+#| label: fig-predicted-faceted
+#| fig-width: 10
+#| fig-height: 5
+predicted_plot <- ggplot() +
+  geom_point(
+    data = observed_rates,
+    aes(x = item_position_within_form, y = missingness),
+    color = "#4D4D4D", size = 1.7, alpha = 0.75
+  ) +
+  geom_ribbon(
+    data = predictions,
+    aes(x = item_position_within_form, ymin = lower, ymax = upper),
+    fill = "#67A9CF", alpha = 0.25
+  ) +
+  geom_line(
+    data = predictions,
+    aes(x = item_position_within_form, y = yhat),
+    color = "#176B87", linewidth = 1
+  ) +
+  facet_wrap(~ form_type_label, scales = "free_x") +
+  scale_x_continuous(
+    breaks = \(x) seq(5, ceiling(x[2] / 5) * 5, by = 5),
+    minor_breaks = NULL
+  ) +
+  scale_y_continuous(
+    labels = percent_format(accuracy = 0.1),
+    expand = expansion(mult = c(0, 0.05))
+  ) +
+  labs(
+    x = "Item number",
+    y = "Pr(item missing)",
+    caption = "Points: observed rates. Line: model-predicted probability with 95% CI."
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    panel.grid.minor = element_blank(),
+    strip.text = element_text(face = "bold"),
+    plot.caption = element_text(hjust = 0),
+    plot.background = element_rect(fill = "white", color = NA)
+  )
+
+save_plot_dual(predicted_plot, here("output", "03c_position_effect", "figures", "predicted_by_position"), width = 10, height = 5)
+predicted_plot
+```
+
+We can also overlay both curves on a common axis to facilitate direct comparison. Items 19-31 exist only in the EORTC QLQ-C30.
+
+```{r}
+#| label: fig-predicted-overlay
+#| fig-width: 8
+#| fig-height: 5
+overlay_plot <- ggplot() +
+  geom_point(
+    data = observed_rates,
+    aes(x = item_position_within_form, y = missingness, color = form_type_label),
+    size = 1.5, alpha = 0.5
+  ) +
+  geom_ribbon(
+    data = predictions,
+    aes(x = item_position_within_form, ymin = lower, ymax = upper, fill = form_type_label),
+    alpha = 0.15
+  ) +
+  geom_line(
+    data = predictions,
+    aes(x = item_position_within_form, y = yhat, color = form_type_label),
+    linewidth = 0.9
+  ) +
+  scale_x_continuous(
+    breaks = seq(5, 30, by = 5),
+    minor_breaks = NULL
+  ) +
+  scale_y_continuous(
+    labels = percent_format(accuracy = 0.1),
+    expand = expansion(mult = c(0.02, 0.05))
+  ) +
+  labs(
+    x = "Item number",
+    y = "Pr(item missing)",
+    color = "Form type",
+    fill = "Form type",
+    caption = "Points: observed rates. Lines: model-predicted probabilities with 95% CI."
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    legend.position = "top",
+    panel.grid.minor = element_blank()
+  )
+
+save_plot_dual(overlay_plot, here("output", "03c_position_effect", "figures", "predicted_overlay"), width = 8, height = 5)
+overlay_plot
+```
+
+{{<pagebreak>}}
+
+## First vs Last Item Contrasts
+
+For each form type we contrast the model-predicted probability of missingness at the last item versus the first item. Inference uses simulation from the multivariate normal distribution of the coefficient estimates: 10 000 draws from $\text{MVN}(\hat\beta, \hat V)$ where $\hat V$ = `fit$var` (the cluster-robust sandwich variance from `robcov()`). The point estimate is the plug-in value computed directly from $\hat\beta$; the standard error and interval are derived from the simulation draws.
+
+```{r}
+#| label: sim-contrast-helpers
+
+
+# ── Simulation-based contrasts (probability scale) ───────────────────────────
+# For lrm (binary logistic) models: draws from MVN(coef(fit), fit$var),
+# recomputes Pr(Y=1|X) = plogis(intercept + X*slopes) for each arm per
+# draw, and differences. Uses fit$var which contains the cluster-robust
+# sandwich variance from robcov().
+
+make_ref_newdata <- function(fit, settings = list()) {
+  dd_obj <- eval(as.name(getOption("datadist")))
+  adj <- dd_obj$limits["Adjust to", ]
+  vals <- dd_obj$values
+  d <- list()
+  for (nm in names(adj)) {
+    val <- if (nm %in% names(settings)) settings[[nm]] else adj[[nm]]
+    if (!is.null(vals[[nm]]) && is.character(vals[[nm]])) {
+      d[[nm]] <- factor(val, levels = vals[[nm]])
+    } else {
+      d[[nm]] <- as.numeric(val)
+    }
+  }
+  as.data.frame(d, stringsAsFactors = FALSE)
+}
+
+sim_contrast_prob <- function(fit, settings_a, settings_b,
+                              n_sim = 10000, conf_level = 0.95, seed = 42) {
+  set.seed(seed)
+  beta_hat <- coef(fit)
+  V <- fit$var
+
+  nd_a <- make_ref_newdata(fit, settings_a)
+  nd_b <- make_ref_newdata(fit, settings_b)
+  Xa <- predict(fit, nd_a, type = "x")
+  Xb <- predict(fit, nd_b, type = "x")
+
+  slope_idx <- 2:length(beta_hat)
+
+  # Plug-in point estimates from the MLE
+  prob_a_hat <- plogis(beta_hat[1] + sum(Xa * beta_hat[slope_idx]))
+  prob_b_hat <- plogis(beta_hat[1] + sum(Xb * beta_hat[slope_idx]))
+  estimate_hat <- prob_a_hat - prob_b_hat
+
+  # Simulation for SE and CI
+  beta_sim <- MASS::mvrnorm(n_sim, beta_hat, V)
+  diffs <- numeric(n_sim)
+
+  for (i in seq_len(n_sim)) {
+    int_i    <- beta_sim[i, 1]
+    slopes_i <- beta_sim[i, slope_idx]
+    diffs[i] <- plogis(int_i + sum(Xa * slopes_i)) -
+                plogis(int_i + sum(Xb * slopes_i))
+  }
+
+  alpha <- 1 - conf_level
+  se <- sd(diffs)
+
+  tibble(
+    prob_a    = prob_a_hat,
+    prob_b    = prob_b_hat,
+    estimate  = estimate_hat,
+    std.error = se,
+    conf.low  = quantile(diffs, alpha / 2, names = FALSE),
+    conf.high = quantile(diffs, 1 - alpha / 2, names = FALSE),
+    p.value   = 2 * pnorm(-abs(estimate_hat / se))
+  )
+}
+```
+
+```{r}
+#| label: first-last-contrasts
+long_ctr <- sim_contrast_prob(
+  fit,
+  list(item_position_within_form = 31, form_type = "long_version"),
+  list(item_position_within_form = 1,  form_type = "long_version")
+)
+
+short_ctr <- sim_contrast_prob(
+  fit,
+  list(item_position_within_form = 18, form_type = "short_version"),
+  list(item_position_within_form = 1,  form_type = "short_version")
+)
+
+position_contrasts <- bind_rows(
+  long_ctr |>
+    mutate(contrast = "EORTC QLQ-C30: item 31 vs 1", .before = 1) |>
+    rename(prob_last = prob_a, prob_first = prob_b, difference = estimate),
+  short_ctr |>
+    mutate(contrast = "Adapted QLQ-C15-based form: item 18 vs 1", .before = 1) |>
+    rename(prob_last = prob_a, prob_first = prob_b, difference = estimate)
+)
+
+write_parquet(position_contrasts, here("output", "03c_position_effect", "first_last_contrasts.parquet"))
+```
+
+```{r}
+#| label: tbl-contrasts
+position_contrasts |>
+  select(contrast, prob_first, prob_last, difference, std.error, conf.low, conf.high, p.value) |>
+  mutate(
+    across(c(prob_first, prob_last, difference, std.error, conf.low, conf.high),
+           \(x) percent(x, accuracy = 0.01)),
+    p.value = format.pval(p.value, digits = 2, eps = 0.001) |>
+      str_replace("<", "&lt;")
+  ) |>
+  rename(
+    Contrast = contrast,
+    `Pr(missing) position 1` = prob_first,
+    `Pr(missing) last position` = prob_last,
+    Difference = difference,
+    SE = std.error,
+    `95% CI low` = conf.low,
+    `95% CI high` = conf.high,
+    `p-value` = p.value
+  ) |>
+  tt(
+    caption = "Model-predicted probability of missingness at the first versus last item, by form type. Difference is last minus first, on the probability scale. Standard errors and intervals from MVN simulation (10 000 draws)."
+  )
+```
+
+{{<pagebreak>}}
+
+## Model Summary
+
+```{r}
+#| label: odds-ratios
+#| fig-width: 8
+#| fig-height: 4
+fit_summary <- summary(fit)
+fit_summary
+
+par(mar = c(5, 12, 2, 2))
+plot(fit_summary, log = TRUE)
+
+save_base_plot_dual(
+  function() {
+    par(mar=c(5, 12, 2, 2))
+    plot(fit_summary, log=TRUE)
+  },
+  here("output", "03c_position_effect", "figures", "odds_ratios"),
+  width = 8, height = 4
+)
+```
+
+```{r}
+#| label: save-model
+saveRDS(fit, here("output", "03c_position_effect", "fit_position_lrm.rds"))
+```

@@ -1,0 +1,24 @@
+project:
+  type: default
+  output-dir: _site
+  render:
+    - analyses/00_build_analysis_datasets.qmd
+    - analyses/01_cohort_description.qmd
+    - analyses/02_missingness_descriptive.qmd
+    - analyses/03a_missingness_imputation.qmd
+    - analyses/03b_missingness_models_binary.qmd
+    - analyses/03c_item_position_effect.qmd
+    - analyses/04_score_computability.qmd
+    - analyses/05_reminder_design.qmd
+    - analyses/06_redcap_staff_survey.qmd
+    - analyses/07_survey_completion_time.qmd
+
+execute:
+  echo: false
+  warning: false
+  message: false
+
+format:
+  typst:
+    toc: true
+    number-sections: true

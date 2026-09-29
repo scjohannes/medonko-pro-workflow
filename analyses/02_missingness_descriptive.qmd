@@ -1,0 +1,354 @@
+---
+title: "Missingness Descriptives"
+author: "Johannes Schwenke"
+date: today
+format:
+  typst: default
+---
+
+## Overview
+
+This document describes questionnaire missingness patterns before any inferential modelling.
+
+```{r}
+#| label: setup
+library(here)
+library(arrow)
+library(Hmisc)
+library(tidyverse)
+library(scales)
+library(tinytable)
+library(patchwork)
+
+source(here("R", "io.R"))
+
+followup_limit_days <- 182L
+
+ensure_dir(here("output", "02_missingness_descriptive"))
+ensure_dir(here("output", "02_missingness_descriptive", "figures"))
+```
+
+```{r}
+#| label: load-data
+questionnaires <- read_parquet(here("output", "derived", "questionnaires.parquet")) |>
+  filter(
+    !is.na(days_since_first_contact),
+    days_since_first_contact >= 0,
+    days_since_first_contact <= followup_limit_days
+  ) |>
+  mutate(
+    form_type = factor(form_type),
+    form_type_label = factor(
+      form_type,
+      levels = c("long_version", "short_version"),
+      labels = c("EORTC QLQ-C30", "Adapted QLQ-C15-based form")
+    ),
+    sex = factor(sex),
+    ecog_baseline = forcats::fct_explicit_na(factor(ecog_baseline_analysis), "Missing")
+  )
+
+items <- read_parquet(here("output", "derived", "questionnaire_items_long.parquet")) |>
+  filter(
+    !is.na(days_since_first_contact),
+    days_since_first_contact >= 0,
+    days_since_first_contact <= followup_limit_days
+  ) |>
+  mutate(
+    form_type = factor(form_type),
+    form_type_label = factor(
+      form_type,
+      levels = c("long_version", "short_version"),
+      labels = c("EORTC QLQ-C30", "Adapted QLQ-C15-based form")
+    ),
+    sex = factor(sex),
+    ecog_baseline = forcats::fct_explicit_na(factor(ecog_baseline_analysis), "Missing")
+  )
+```
+
+```{r}
+#| label: item-summaries
+item_missingness <- items |>
+  filter(!is_structural_absence) |>
+  summarise(
+    n_eligible = dplyr::n(),
+    answer_rate = mean(is_answered),
+    missingness = mean(is_missing_nonstructural),
+    .by = c(form_type, form_type_label, item_code, item_position_within_form)
+  ) |>
+  arrange(form_type, item_position_within_form)
+
+followup_item_inventory <- items |>
+  filter(form_type == "short_version", !is_structural_absence) |>
+  distinct(form_type, form_type_label, item_code, item_position_within_form) |>
+  arrange(item_position_within_form)
+
+questionnaire_missingness <- questionnaires |>
+  mutate(
+    any_missing_nonstructural = n_items_missing_nonstructural > 0,
+    age_group = cut_number(age, n = 5),
+    ecog_group = forcats::fct_explicit_na(factor(ecog_baseline), "Missing")
+  )
+
+pattern_summary <- list(
+  questionnaire_describe = Hmisc::describe(questionnaires |>
+    select(
+      n_items_eligible,
+      n_items_answered,
+      n_items_missing_nonstructural,
+      prop_missing_nonstructural,
+      any_missing_nonstructural,
+      n_terminal_missing,
+      n_intermittent_missing
+    )),
+  item_describe = Hmisc::describe(items |>
+    filter(!is_structural_absence) |>
+    select(item_position_within_form, is_answered, is_missing_nonstructural))
+)
+
+write_parquet(item_missingness, here("output", "02_missingness_descriptive", "item_missingness.parquet"))
+write_parquet(followup_item_inventory, here("output", "02_missingness_descriptive", "followup_item_inventory.parquet"))
+write_parquet(questionnaire_missingness, here("output", "02_missingness_descriptive", "questionnaire_missingness.parquet"))
+saveRDS(pattern_summary, here("output", "02_missingness_descriptive", "pattern_summary.rds"))
+```
+
+```{r}
+#| label: plot-helpers
+make_position_bar <- function(data, title) {
+  data |>
+    ggplot(aes(x = item_position_within_form, y = missingness)) +
+    geom_col(width = 0.8, fill = "grey40") +
+    scale_x_continuous(
+      breaks = seq_len(max(data$item_position_within_form)),
+      guide = guide_axis(check.overlap = TRUE)
+    ) +
+    scale_y_continuous(labels = percent_format(accuracy = 1), breaks = seq(0, 0.12, by = 0.02)) +
+    coord_cartesian(ylim = c(0, 0.11)) +
+    labs(
+      title = title,
+      x = "Item number",
+      y = "Missingness"
+    ) +
+    theme_minimal(base_size = 11) +
+    theme(panel.grid.major.x = element_blank())
+}
+
+age_breaks <- c(18, 45, 55, 65, 75, Inf)
+age_labels <- c("18\u201344", "45\u201354", "55\u201364", "65\u201374", "75+")
+
+make_strata_plot <- function(data, form_label) {
+  d <- data |>
+    filter(form_type_label == form_label) |>
+    mutate(
+      age_group = cut(age, breaks = age_breaks, labels = age_labels, right = FALSE),
+      ecog_group = as.character(ecog_baseline),
+      sex = as.character(sex),
+      language = as.character(language),
+      marital_status = as.character(marital_status)
+    )
+
+  bind_rows(
+    d |> summarise(prop_any_missing = mean(n_items_missing_nonstructural > 0), .by = sex) |>
+      rename(stratum = sex) |> mutate(stratum_type = "Sex"),
+    d |> summarise(prop_any_missing = mean(n_items_missing_nonstructural > 0), .by = age_group) |>
+      rename(stratum = age_group) |> mutate(stratum_type = "Age group", stratum = as.character(stratum)),
+    d |> summarise(prop_any_missing = mean(n_items_missing_nonstructural > 0), .by = ecog_group) |>
+      rename(stratum = ecog_group) |> mutate(stratum_type = "ECOG (baseline)"),
+    d |> summarise(prop_any_missing = mean(n_items_missing_nonstructural > 0), .by = language) |>
+      rename(stratum = language) |> mutate(stratum_type = "Language"),
+    d |> summarise(prop_any_missing = mean(n_items_missing_nonstructural > 0), .by = marital_status) |>
+      rename(stratum = marital_status) |> mutate(stratum_type = "Marital status")
+  ) |>
+    mutate(stratum_type = factor(stratum_type, levels = c("Sex", "Age group", "ECOG (baseline)", "Language", "Marital status"))) |>
+    ggplot(aes(x = stratum, y = prop_any_missing)) +
+    geom_col(fill = "#176B87", width = 0.78, show.legend = FALSE) +
+    facet_wrap(vars(stratum_type), scales = "free_x", nrow = 1) +
+    scale_y_continuous(labels = percent_format(accuracy = 1), expand = expansion(mult = c(0, 0.05))) +
+    labs(
+      title = form_label,
+      x = NULL,
+      y = "Questionnaires with any missing item"
+    ) +
+    theme_minimal(base_size = 11) +
+    theme(
+      axis.text.x = element_text(angle = 30, hjust = 1),
+      panel.grid.major.x = element_blank(),
+      panel.grid.minor = element_blank(),
+      strip.text = element_text(face = "bold"),
+      plot.title = element_text(face = "bold"),
+      plot.background = element_rect(fill = "white", color = NA)
+    )
+}
+```
+
+```{r}
+#| label: fig-position
+#| fig-width: 10
+#| fig-height: 4
+position_plot <- {
+  plots <- item_missingness |>
+    group_by(form_type_label) |>
+    group_map(~ make_position_bar(.x, as.character(.y$form_type_label)), .keep = TRUE)
+  patchwork::wrap_plots(plots, nrow = 1)
+}
+save_plot_dual(position_plot, here("output", "02_missingness_descriptive", "figures", "missingness_by_position"))
+position_plot
+```
+
+```{r}
+#| label: fig-questionnaire-number
+#| fig-width: 7
+#| fig-height: 4
+questionnaire_number_plot <- {
+  qn_data <- questionnaires |>
+    filter(form_type == "short_version") |>
+    summarise(
+      prop_any_missing = mean(n_items_missing_nonstructural > 0),
+      n = dplyr::n(),
+      .by = questionnaire_number
+    ) |>
+    filter(n >= 10)
+
+  ggplot(qn_data, aes(x = questionnaire_number, y = prop_any_missing)) +
+    geom_col(width = 0.7, fill = "grey40") +
+    geom_text(
+      aes(y = 0, label = paste0("n=", n)),
+      vjust = 1.5,
+      size = 2.8,
+      color = "grey60"
+    ) +
+    scale_y_continuous(
+      labels = percent_format(accuracy = 1),
+      expand = expansion(mult = c(0.1, 0.05))
+    ) +
+    scale_x_continuous(breaks = qn_data$questionnaire_number) +
+    labs(
+      x = "Questionnaire number within patient",
+      y = "Questionnaires with any missing item",
+      subtitle = "Adapted QLQ-C15-based forms with \u226510 patients; n shown per time point"
+    ) +
+    theme_minimal(base_size = 11) +
+    theme(panel.grid.major.x = element_blank())
+}
+save_plot_dual(questionnaire_number_plot, here("output", "02_missingness_descriptive", "figures", "missingness_by_questionnaire_number"))
+questionnaire_number_plot
+```
+
+```{r}
+#| label: fig-heatmap
+#| fig-width: 6
+#| fig-height: 5
+heatmap_plot <- items |>
+  filter(!is_structural_absence, form_type == "short_version") |>
+  summarise(
+    missingness = mean(is_missing_nonstructural),
+    n = n(),
+    .by = c(questionnaire_number, item_position_within_form)
+  ) |>
+  filter(n >= 10) |>
+  ggplot(aes(x = item_position_within_form, y = questionnaire_number, fill = missingness)) +
+  geom_tile() +
+  scale_fill_distiller(palette = "YlOrRd", direction = 1, labels = percent_format(accuracy = 1)) +
+  scale_x_continuous(breaks = 1:18) +
+  scale_y_continuous(breaks = 1:11) +
+  labs(
+    title = "Adapted QLQ-C15-based form",
+    subtitle = "Cells with \u003c10 items excluded",
+    x = "Item number",
+    y = "Questionnaire number within patient",
+    fill = "Missingness"
+  ) +
+  theme_minimal(base_size = 11)
+save_plot_dual(heatmap_plot, here("output", "02_missingness_descriptive", "figures", "missingness_heatmap"), width = 6, height = 5)
+heatmap_plot
+```
+
+```{r}
+#| label: fig-burden
+#| fig-width: 9
+#| fig-height: 4
+make_burden_plot <- function(data, form, max_missing, x_breaks, title) {
+  burden_counts <- data |>
+    filter(form_type == form) |>
+    count(n_items_missing_nonstructural, name = "n_questionnaires") |>
+    complete(
+      n_items_missing_nonstructural = 0:max_missing,
+      fill = list(n_questionnaires = 0L)
+    )
+  ggplot(
+    burden_counts,
+    aes(x = n_items_missing_nonstructural, y = n_questionnaires)
+  ) +
+    geom_col(width = 0.82, fill = "#176B87") +
+    scale_x_continuous(breaks = x_breaks, limits = c(-0.5, max_missing + 0.5)) +
+    scale_y_continuous(labels = label_number(), expand = expansion(mult = c(0, 0.06))) +
+    labs(
+      title = title,
+      x = "Missing items",
+      y = "Questionnaires"
+    ) +
+    theme_minimal(base_size = 12) +
+    theme(
+      panel.grid.major.x = element_blank(),
+      panel.grid.minor = element_blank(),
+      plot.title = element_text(face = "bold", size = 11),
+      plot.background = element_rect(fill = "white", color = NA)
+    )
+}
+
+burden_long_plot <- make_burden_plot(
+  questionnaires,
+  form = "long_version",
+  max_missing = 31,
+  x_breaks = seq(0, 30, by = 5),
+  title = "EORTC QLQ-C30"
+)
+
+burden_short_plot <- make_burden_plot(
+  questionnaires,
+  form = "short_version",
+  max_missing = 18,
+  x_breaks = seq(0, 18, by = 3),
+  title = "Adapted QLQ-C15-based form"
+)
+
+burden_plot <- burden_long_plot + burden_short_plot
+save_plot_dual(burden_plot, here("output", "02_missingness_descriptive", "figures", "missingness_burden"), width = 9, height = 5)
+burden_plot
+```
+
+```{r}
+#| label: fig-strata
+#| fig-width: 12
+#| fig-height: 8
+strata_plot <- make_strata_plot(questionnaires, "EORTC QLQ-C30") /
+  make_strata_plot(questionnaires, "Adapted QLQ-C15-based form")
+save_plot_dual(strata_plot, here("output", "02_missingness_descriptive", "figures", "missingness_by_strata"), width = 12, height = 8)
+strata_plot
+```
+
+```{r}
+#| label: fig-noquestionnaire
+#| fig-width: 6
+#| fig-height: 4
+noquestionnaire_plot <- questionnaires |>
+  group_by(noquestionnaire) |>
+  summarise(
+    prop_any_missing = mean(n_items_missing_nonstructural > 0),
+    n = dplyr::n(),
+    .groups = "drop"
+  ) |>
+  mutate(noquestionnaire = forcats::fct_reorder(noquestionnaire, prop_any_missing)) |>
+  ggplot(aes(x = prop_any_missing, y = noquestionnaire)) +
+  geom_col(fill = "grey40") +
+  geom_text(aes(label = percent(prop_any_missing, accuracy = 0.1)), hjust = -0.2, size = 3.5) +
+  scale_x_continuous(labels = percent_format(accuracy = 1), expand = expansion(mult = c(0, 0.15))) +
+  labs(
+    x = "Questionnaires with any missing item",
+    y = NULL
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(panel.grid.major.y = element_blank())
+
+save_plot_dual(noquestionnaire_plot, here("output", "02_missingness_descriptive", "figures", "noquestionnaire"), width = 6, height = 4)
+noquestionnaire_plot
+```

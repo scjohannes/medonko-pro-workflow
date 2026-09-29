@@ -47,3 +47,23 @@ po/*~
 
 # RStudio Connect folder
 rsconnect/
+
+# Patient-level data: never commit
+/data/
+
+# Analysis outputs (derived datasets and imputations contain patient-level data)
+/output/
+
+# Belt and braces: data file formats used by the pipeline
+*.parquet
+*.rds
+*.RDS
+*.csv
+*.xlsx
+*.xls
+
+# Quarto render and cache directories
+/.quarto/
+**/*.quarto_ipynb
+_freeze/
+_site/

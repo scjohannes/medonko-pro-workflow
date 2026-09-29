@@ -1,0 +1,372 @@
+---
+title: "Build Analysis Datasets"
+author: "Johannes Schwenke"
+date: today
+format:
+  typst: default
+---
+
+## Overview
+
+This document creates the shared analytical datasets used by all downstream analyses.
+
+```{r}
+#| label: setup
+library(here)
+library(arrow)
+library(tidyverse)
+library(tinytable)
+
+source(here("R", "io.R"))
+
+followup_limit_days <- 182L
+
+ensure_dir(here("output", "derived"))
+```
+
+```{r}
+#| label: lookup
+
+long_version_order <- c(
+  "distress_therm", "q29", "q30", paste0("q", 1:28)
+)
+
+short_version_order <- c(
+  "q29", "q30", "q3", "q4", "q5", "q18", "q8", "q9",
+  paste0("q", 11:17), "q19", "q24", "q21"
+)
+
+questionnaire_model_items <- long_version_order
+questionnaire_response_fields <- c(
+  "distress_therm_2", "distress_therm_v2", "distress_therm_inpat",
+  "q29", "q30", paste0("q", 1:28)
+)
+
+position_lookup <- bind_rows(
+  tibble(
+    form_type = "long_version",
+    item_code = long_version_order,
+    item_position_within_form = seq_along(long_version_order)
+  ),
+  tibble(
+    form_type = "short_version",
+    item_code = short_version_order,
+    item_position_within_form = seq_along(short_version_order)
+  ))
+# ) |>
+#   left_join(
+#     tibble(
+#       item_code = long_version_order,
+#       item_position_global = seq_along(long_version_order)
+#     ),
+#     by = "item_code"
+#   )
+```
+
+```{r}
+#| label: load-data
+raw_data <- read_parquet(here("data", "clean", "analysis_data_long_2026-08-11.parquet"))
+
+harmonized_data <- raw_data |>
+  mutate(
+    distress_therm = coalesce(
+      distress_therm_2,
+      distress_therm_v2,
+      distress_therm_inpat
+    ),
+    any_questionnaire_response = select(
+      pick(everything()),
+      all_of(questionnaire_response_fields)
+    ) |>
+      (\(x) rowSums(!is.na(x)) > 0)(),
+    valid_encounter_type = !is.na(encounter_type) & encounter_type %in% c(1, 2, 3)
+  )
+```
+
+```{r}
+#| label: derive-patients-baseline
+patient_rows <- raw_data |>
+  arrange(pat_id, days_since_fstcnt, app_day) |>
+  group_by(pat_id) |>
+  slice_head(n = 1) |>
+  ungroup()
+
+top5_diag <- patient_rows |>
+  count(diagnosis, sort = TRUE) |>
+  filter(!is.na(diagnosis)) |>
+  slice_head(n = 5) |>
+  pull(diagnosis)
+
+top5_plan <- patient_rows |>
+  count(plan_fstcnt_coded, sort = TRUE) |>
+  filter(!is.na(plan_fstcnt_coded)) |>
+  slice_head(n = 5) |>
+  pull(plan_fstcnt_coded)
+
+questionnaire_counts <- harmonized_data |>
+  filter(
+    quest_status == 1,
+    valid_encounter_type,
+    is.na(noquestionnaire) | noquestionnaire != 4,
+    !is.na(days_since_fstcnt),
+    days_since_fstcnt >= 0,
+    days_since_fstcnt <= followup_limit_days
+  ) |>
+  count(pat_id, name = "n_questionnaires")
+
+appointment_counts <- raw_data |>
+  filter(
+    !is.na(days_since_fstcnt),
+    days_since_fstcnt >= 0,
+    days_since_fstcnt <= followup_limit_days
+  ) |>
+  summarise(
+    n_appointments = n_distinct(days_since_fstcnt),
+    .by = "pat_id"
+  )
+
+patients_baseline <- patient_rows |>
+  mutate(
+    age = pat_age,
+    sex = factor(gender),
+    marital_status_fct = case_when(
+      marital_status %in% c("gesch.", "getr.", "verw.") ~ "separated",
+      marital_status %in% c("ledig") ~ "single",
+      marital_status %in% c("verh.") ~ "married",
+      TRUE ~ "other"
+    ),
+    marital_status_fct = factor(marital_status_fct, levels = c("single", "married", "separated", "other"),
+      labels = c("Single", "Married", "Separated", "Other")),
+    language_fct = case_when(
+      language %in% c("Deutsch") ~ "german",
+      language %in% c("Englisch") ~ "english",
+      language %in% c("Italienisch") ~ "italian",
+      language %in% c("Französisch") ~ "french",
+      TRUE ~ "other"
+    ),
+    language_fct = factor(language_fct, levels = c("german", "english", "italian", "french", "other"),
+      labels = c("German", "English", "Italian", "French", "Other")),
+    ecog_baseline = ordered(ecog_fstcnt),
+    ecog_baseline_analysis = ordered(
+      if_else(
+        as.character(ecog_fstcnt) %in% c("3", "4"),
+        "3+",
+        as.character(ecog_fstcnt)
+      ),
+      levels = c("0", "1", "2", "3+")
+    ),
+    diagnosis = factor(diagnosis),
+    diagnosis_group = factor(
+      case_when(
+        is.na(diagnosis) ~ "Missing",
+        diagnosis %in% top5_diag ~ as.character(diagnosis),
+        TRUE ~ "Other"
+      ),
+      levels = c(top5_diag, "Other", "Missing")
+    ),
+    treatment_plan = factor(plan_fstcnt_coded),
+    treatment_plan_group = factor(
+      case_when(
+        is.na(plan_fstcnt_coded) ~ "Missing",
+        plan_fstcnt_coded %in% top5_plan ~ as.character(plan_fstcnt_coded),
+        TRUE ~ "Other"
+      ),
+      levels = c(top5_plan, "Other", "Missing")
+    ),
+    reminder = factor(reminder, levels = c(0, 1), labels = c("No", "Yes"))
+  ) |>
+  select(
+    pat_id,
+    age,
+    sex,
+    language = language_fct,
+    marital_status = marital_status_fct,
+    ecog_baseline,
+    ecog_baseline_analysis,
+    diagnosis,
+    diagnosis_group,
+    treatment_plan,
+    treatment_plan_group,
+    reminder
+  ) |>
+  left_join(questionnaire_counts, by = "pat_id") |>
+  left_join(appointment_counts, by = "pat_id") |>
+  mutate(
+    n_questionnaires = replace_na(n_questionnaires, 0L),
+    n_appointments = replace_na(n_appointments, 0L)
+  )
+
+martial_status <- patients_baseline |>
+  count(marital_status, sort = TRUE)
+
+language <- patients_baseline |>
+  count(language, sort = TRUE)
+```
+
+```{r}
+#| label: derive-questionnaires-wide
+
+invalid_questionnaires <- harmonized_data |>
+  filter(quest_status == 1, !valid_encounter_type)
+
+technical_failure_questionnaires <- invalid_questionnaires |>
+  filter(!any_questionnaire_response)
+
+response_present_invalid_questionnaires <- invalid_questionnaires |>
+  filter(any_questionnaire_response)
+
+if (nrow(response_present_invalid_questionnaires) > 0) {
+  invalid_keys <- response_present_invalid_questionnaires |>
+    mutate(
+      invalid_key = paste(
+        pat_id,
+        days_since_fstcnt,
+        app_day,
+        encounter_type,
+        sep = "/"
+      )
+    ) |>
+    pull(invalid_key)
+
+  stop(
+    paste(
+      "Found quest_status == 1 rows with invalid encounter_type and observed responses:",
+      paste(invalid_keys, collapse = ", ")
+    )
+  )
+}
+
+questionnaires_wide <- harmonized_data |>
+  filter(quest_status == 1, valid_encounter_type) |>
+  arrange(pat_id, days_since_fstcnt, app_day) |>
+  group_by(pat_id) |>
+  mutate(questionnaire_number = row_number()) |>
+  ungroup() |>
+  mutate(
+    questionnaire_key = paste(pat_id, questionnaire_number, sep = "_"),
+    form_type = case_when(
+      encounter_type == 1 ~ "long_version",
+      encounter_type %in% c(2, 3) ~ "short_version"
+    )
+  ) |>
+  mutate(
+    form_type = factor(form_type, levels = c("long_version", "short_version")),
+    noquestionnaire = factor(noquestionnaire, levels = c(1, 2, 3, 4, 5),
+      labels = c(
+        "Completed independently",
+        "Patient declined to complete",
+        "Patient unable to complete",
+        "Technical issues",
+        "Completed with assistance"
+      )
+    )
+  ) |>
+  select(
+    pat_id,
+    questionnaire_number,
+    questionnaire_key,
+    form_type,
+    noquestionnaire,
+    days_since_first_contact = days_since_fstcnt,
+    days_since_questionnaire_program_start = days_since_intro_quest,
+    days_since_liqplat_start = days_since_start_liqplat,
+    days_since_liqplat_screening = days_since_screening,
+    app_day,
+    encounter_type,
+    distress_therm,
+    q29,
+    q30,
+    all_of(paste0("q", 1:28))
+  ) |>
+  left_join(patients_baseline, by = "pat_id") |> 
+  # remove technical failures
+  filter_out(noquestionnaire == "Technical issues")
+```
+
+```{r}
+#| label: derive-questionnaire-items
+questionnaire_items_long <- questionnaires_wide |>
+  pivot_longer(
+    cols = all_of(questionnaire_model_items),
+    names_to = "item_code",
+    values_to = "response"
+  ) |>
+  mutate(
+    is_structural_absence = form_type == "short_version" & !(item_code %in% short_version_order),
+    is_answered = !is.na(response) & !is_structural_absence
+  ) |>
+  left_join(position_lookup, by = c("form_type", "item_code")) |>
+  mutate(
+    is_missing_nonstructural = !is_structural_absence & is.na(response)
+  ) |>
+  arrange(pat_id, questionnaire_number, item_position_within_form)
+```
+
+```{r}
+#| label: derive-questionnaire-summaries
+questionnaire_summary_base <- questionnaire_items_long |>
+  filter(!is_structural_absence) |>
+  summarise(
+    n_items_eligible = n(),
+    n_items_answered = sum(is_answered),
+    n_items_missing_nonstructural = sum(is_missing_nonstructural),
+    prop_missing_nonstructural = mean(is_missing_nonstructural),
+    last_answered_position = {
+      answered_positions <- item_position_within_form[is_answered]
+      if (length(answered_positions) == 0) {
+        0L
+      } else {
+        max(answered_positions)
+      }
+    },
+    any_missing_nonstructural = any(is_missing_nonstructural),
+    .by = c(
+      "pat_id", "questionnaire_number", "questionnaire_key", "form_type", "noquestionnaire",
+      "days_since_first_contact", "days_since_questionnaire_program_start",
+      "days_since_liqplat_start", "days_since_liqplat_screening",
+      "app_day", "encounter_type", "age", "sex", "language", "marital_status", "ecog_baseline",
+      "ecog_baseline_analysis",
+      "diagnosis", "diagnosis_group", "treatment_plan",
+      "treatment_plan_group", "reminder"
+    )
+  )
+
+terminal_missing <- questionnaire_items_long |>
+  filter(!is_structural_absence) |>
+  left_join(
+    questionnaire_summary_base |>
+      select(questionnaire_key, last_answered_position),
+    by = "questionnaire_key"
+  ) |>
+  summarise(
+    n_terminal_missing = sum(
+      is_missing_nonstructural &
+        item_position_within_form > last_answered_position
+    ),
+    n_intermittent_missing = sum(
+      is_missing_nonstructural &
+        item_position_within_form <= last_answered_position
+    ),
+    .by = "questionnaire_key"
+  )
+
+#1	Ja
+# 5	Ja - mit Unterstützung
+# 2	Patientin / Patient möchte Fragebogen nicht ausfüllen
+# 3	Patientin / Patient kann Fragebogen nicht ausfüllen
+# 4	Technische Probleme
+
+questionnaires <- questionnaire_summary_base |>
+  left_join(terminal_missing, by = "questionnaire_key") |>
+  mutate(
+    n_terminal_missing = replace_na(n_terminal_missing, 0L),
+    n_intermittent_missing = replace_na(n_intermittent_missing, 0L)  
+)
+```
+
+```{r}
+#| label: save-derived
+write_parquet(patients_baseline, here("output", "derived", "patients_baseline.parquet"))
+write_parquet(questionnaires, here("output", "derived", "questionnaires.parquet"))
+write_parquet(questionnaire_items_long, here("output", "derived", "questionnaire_items_long.parquet"))
+```

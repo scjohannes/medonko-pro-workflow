@@ -1,0 +1,122 @@
+---
+title: "Cohort Description"
+author: "Johannes Schwenke"
+date: today
+format:
+  typst: default
+---
+
+## Overview
+
+This document describes the patient cohort using static baseline characteristics and per-patient follow-up counts.
+
+```{r}
+#| label: setup
+library(here)
+library(arrow)
+library(table1)
+library(tidyverse)
+library(tinytable)
+
+source(here("R", "io.R"))
+source(here("R", "table_rendering.R"))
+
+ensure_dir(here("output", "01_cohort"))
+```
+
+
+```{r}
+#| label: load-data
+patients <- read_parquet(here("output", "derived", "patients_baseline.parquet")) |>
+  mutate(
+    ecog_baseline = forcats::fct_na_value_to_level(factor(ecog_baseline), level = "Missing"),
+    diagnosis_group = forcats::fct_recode(
+      factor(diagnosis_group),
+      "Lung" = "LUNG",
+      "Lymphoid malignancy" = "LYMPH",
+      "Skin" = "SKIN",
+      "Prostate" = "PROSTATE",
+      "Gastrointestinal" = "BOWEL"
+    ),
+    diagnosis_group = forcats::fct_na_value_to_level(
+      diagnosis_group,
+      level = "Missing"
+    ),
+    treatment_plan_group = forcats::fct_na_value_to_level(factor(treatment_plan_group), level = "Missing")
+  )
+```
+
+```{r}
+#| label: build-table1
+table1_data <- patients |>
+  mutate(
+    Age = age,
+    Sex = sex,
+    Language = language,
+    `Marital status` = marital_status,
+    ECOG = ecog_baseline,
+    `Primary cancer site` = diagnosis_group,
+    `Treatment plan` = treatment_plan_group,
+    `Had reminder` = reminder,
+    `Reminder group` = factor(
+      reminder,
+      levels = c("No", "Yes"),
+      labels = c("No reminder", "Reminder")
+    ),
+    `Questionnaires per patient` = n_questionnaires,
+    `Appointment days per patient` = n_appointments
+  ) |>
+  select(
+    Age,
+    Sex,
+    Language,
+    `Marital status`,
+    ECOG,
+    `Primary cancer site`,
+    `Treatment plan`,
+    `Had reminder`,
+    `Reminder group`,
+    `Questionnaires per patient`,
+    `Appointment days per patient`
+  )
+
+cohort_main_table1 <- table1(
+  ~ Age + Sex + Language + `Marital status` + ECOG + `Primary cancer site` +
+    `Treatment plan` +
+    `Had reminder` + `Questionnaires per patient` +
+    `Appointment days per patient`,
+  data = table1_data,
+  caption = "Baseline characteristics of the cohort.",
+  render.continuous = c(. = "Median [Min, Max]")
+)
+
+cohort_by_reminder_table1 <- table1(
+  ~ Age + Sex + Language + `Marital status` + ECOG + `Primary cancer site` +
+    `Treatment plan` +
+    `Questionnaires per patient` + `Appointment days per patient` | `Reminder group`,
+  data = table1_data,
+  caption = "Baseline characteristics by reminder status.",
+  render.continuous = c(. = "Median [Min, Max]"),
+  overall = FALSE
+)
+
+# Save table1 objects for use in report
+saveRDS(cohort_main_table1, here("output", "01_cohort", "cohort_main_table1.rds"))
+saveRDS(cohort_by_reminder_table1, here("output", "01_cohort", "cohort_by_reminder_table1.rds"))
+```
+
+{{< pagebreak >}}
+
+## Main Table
+
+```{r}
+table1_tinytable(cohort_main_table1)
+```
+
+{{< pagebreak >}}
+
+## By Reminder Status
+
+```{r}
+table1_tinytable(cohort_by_reminder_table1)
+```

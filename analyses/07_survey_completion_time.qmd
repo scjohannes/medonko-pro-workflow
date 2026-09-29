@@ -1,0 +1,152 @@
+---
+title: "Survey Completion Time"
+author: "Johannes Schwenke"
+date: today
+format:
+  typst: default
+---
+
+## Overview
+
+This document summarizes the time required to complete or partially complete the long and short questionnaires. Records without a positive survey time are not included. Questionnaire form is classified from encounter type using the same rule as the shared analysis-dataset pipeline.
+
+```{r}
+#| label: setup
+library(here)
+library(arrow)
+library(tidyverse)
+library(tinytable)
+
+source(here("R", "io.R"))
+
+output_dir <- here("output", "07_survey_completion_time")
+ensure_dir(output_dir)
+
+followup_limit_days <- 182L
+```
+
+## Analysis Data
+
+Survey time is recorded in minutes. Questionnaires recorded from day 0 through day 182 after first contact are included. All positive recorded durations within this follow-up window are included without truncation, exclusion, or imputation. Median and interquartile range are used because the duration distribution is strongly right-skewed and includes surveys that may have remained open after active completion stopped.
+
+```{r}
+#| label: load-data
+survey_time_source <- read_parquet(
+  here("data", "clean", "analysis_data_long_2026-08-11.parquet")
+) |>
+  filter(
+    quest_status == 1,
+    encounter_type %in% c(1, 2, 3),
+    !is.na(days_since_fstcnt),
+    days_since_fstcnt >= 0,
+    days_since_fstcnt <= followup_limit_days
+  ) |>
+  mutate(
+    form_type = case_when(
+      encounter_type == 1 ~ "long_version",
+      encounter_type %in% c(2, 3) ~ "short_version"
+    ),
+    questionnaire_form = case_when(
+      form_type == "long_version" ~ "Long questionnaire",
+      form_type == "short_version" ~ "Short questionnaire"
+    ),
+    questionnaire_form = factor(
+      questionnaire_form,
+      levels = c("Long questionnaire", "Short questionnaire")
+    )
+  )
+
+survey_time_data <- survey_time_source |>
+  filter(!is.na(survey_time), survey_time > 0)
+```
+
+## Completion-Time Summary
+
+```{r}
+#| label: summarize-survey-time
+survey_time_summary <- survey_time_data |>
+  summarise(
+    n = n(),
+    median_minutes = median(survey_time),
+    q1_minutes = quantile(survey_time, 0.25),
+    q3_minutes = quantile(survey_time, 0.75),
+    .by = questionnaire_form
+  ) |>
+  arrange(questionnaire_form)
+
+survey_time_data_quality <- survey_time_source |>
+  summarise(
+    n_eligible_questionnaire_records = n(),
+    n_positive_recorded_durations = sum(
+      !is.na(survey_time) & survey_time > 0
+    ),
+    n_without_positive_recorded_duration = sum(
+      is.na(survey_time) | survey_time <= 0
+    ),
+    .by = questionnaire_form
+  ) |>
+  arrange(questionnaire_form)
+
+survey_time_metadata <- tibble(
+  name = c(
+    "n_positive_recorded_durations",
+    "summary_measure"
+  ),
+  value = c(
+    as.character(nrow(survey_time_data)),
+    "Median and interquartile range"
+  )
+)
+
+write_parquet(
+  survey_time_summary,
+  here(output_dir, "survey_time_summary.parquet")
+)
+write_parquet(
+  survey_time_data_quality,
+  here(output_dir, "survey_time_data_quality.parquet")
+)
+write_parquet(
+  survey_time_metadata,
+  here(output_dir, "metadata.parquet")
+)
+```
+
+```{r}
+#| label: tbl-survey-time-summary
+#| tbl-cap: "Survey completion time by questionnaire form."
+
+survey_time_table <- survey_time_summary |>
+  mutate(
+    `Median [Q1, Q3], minutes` = sprintf(
+      "%.1f [%.1f, %.1f]",
+      median_minutes,
+      q1_minutes,
+      q3_minutes
+    )
+  ) |>
+  select(
+    `Questionnaire form` = questionnaire_form,
+    n,
+    `Median [Q1, Q3], minutes`
+  )
+
+tt(survey_time_table)
+```
+
+## Data Availability
+
+```{r}
+#| label: tbl-survey-time-data-quality
+#| tbl-cap: "Availability of positive recorded survey durations."
+
+survey_time_data_quality_table <- survey_time_data_quality |>
+  select(
+    `Questionnaire form` = questionnaire_form,
+    `Eligible questionnaire records` = n_eligible_questionnaire_records,
+    `Positive recorded durations` = n_positive_recorded_durations,
+    `Without positive recorded duration` = n_without_positive_recorded_duration
+  )
+
+tt(survey_time_data_quality_table)
+```

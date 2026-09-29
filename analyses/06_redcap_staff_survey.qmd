@@ -1,0 +1,372 @@
+---
+title: "REDCap Staff Survey"
+author: "Johannes Schwenke"
+date: today
+format:
+  typst: default
+---
+
+## Overview
+
+This document summarizes the staff survey on REDCap-based PROMs outputs and saves tables and figures for the manuscript appendix.
+
+```{r}
+#| label: setup
+library(here)
+library(arrow)
+library(dplyr)
+library(ggplot2)
+library(scales)
+library(tinytable)
+library(grid)
+
+source(here("R", "io.R"))
+
+output_dir <- here("output", "06_redcap_staff_survey")
+figure_dir <- here(output_dir, "figures")
+
+ensure_dir(output_dir)
+ensure_dir(figure_dir)
+```
+
+```{r}
+#| label: load-data
+redcap_staff_survey <- read.csv(
+  here("data", "clean", "UmfrageQoLInDerMedOn_DATA_2026-06-21_1421.csv"),
+  check.names = FALSE
+)
+names(redcap_staff_survey)[1] <- "record_id"
+redcap_staff_survey$survey_timestamp <- as.POSIXct(
+  redcap_staff_survey$umfrage_zur_qol_timestamp,
+  tz = "Europe/Zurich"
+)
+
+survey_group_labels <- c(
+  "1" = "Oncology nursing",
+  "2" = "Physicians",
+  "3" = "Psycho-oncology"
+)
+survey_group_levels <- c("Physicians", "Oncology nursing", "Psycho-oncology")
+survey_usefulness_labels <- c(
+  "1" = "Very useful",
+  "2" = "Useful",
+  "3" = "Slightly useful",
+  "4" = "Not useful",
+  "5" = "Do not know"
+)
+survey_use_labels <- c(
+  "1" = "Very often",
+  "2" = "Often",
+  "3" = "Rarely",
+  "4" = "Never"
+)
+
+redcap_staff_survey$group_label <- factor(
+  survey_group_labels[as.character(redcap_staff_survey$group)],
+  levels = survey_group_levels
+)
+```
+
+```{r}
+#| label: survey-summaries
+redcap_survey_metadata <- tibble(
+  name = c("n", "first_date", "last_date"),
+  value = c(
+    as.character(nrow(redcap_staff_survey)),
+    as.character(min(as.Date(redcap_staff_survey$survey_timestamp))),
+    as.character(max(as.Date(redcap_staff_survey$survey_timestamp)))
+  )
+)
+
+redcap_survey_n <- nrow(redcap_staff_survey)
+
+redcap_survey_group_summary <- as.data.frame(
+  table(redcap_staff_survey$group_label),
+  stringsAsFactors = FALSE
+)
+names(redcap_survey_group_summary) <- c("group", "n")
+redcap_survey_group_summary$pct <- redcap_survey_group_summary$n / redcap_survey_n
+redcap_survey_group_summary$percent <- percent(redcap_survey_group_summary$pct, accuracy = 1)
+
+survey_acceptability_row <- function(metric, variable, positive_values = c(1, 2)) {
+  observed <- !is.na(redcap_staff_survey[[variable]])
+  n_positive <- sum(redcap_staff_survey[[variable]][observed] %in% positive_values)
+  total <- sum(observed)
+  data.frame(
+    metric = metric,
+    n = n_positive,
+    total = total,
+    pct = n_positive / total,
+    percent = percent(n_positive / total, accuracy = 1),
+    stringsAsFactors = FALSE
+  )
+}
+
+redcap_survey_acceptability_summary <- do.call(
+  rbind,
+  list(
+    survey_acceptability_row("Initial visit: useful or very useful", "baseline_value"),
+    survey_acceptability_row("Initial visit: integrated often or very often", "baseline_use"),
+    survey_acceptability_row("Follow-up: useful or very useful", "fu_value"),
+    survey_acceptability_row("Follow-up: integrated often or very often", "fu_use")
+  )
+)
+
+survey_acceptability_by_group <- function(metric, variable, positive_values = c(1, 2)) {
+  rows <- lapply(survey_group_levels, function(group) {
+    observed <- !is.na(redcap_staff_survey$group_label) &
+      redcap_staff_survey$group_label == group &
+      !is.na(redcap_staff_survey[[variable]])
+    total <- sum(observed)
+    n_positive <- sum(redcap_staff_survey[[variable]][observed] %in% positive_values)
+    data.frame(
+      group = group,
+      metric = metric,
+      n = n_positive,
+      total = total,
+      pct = n_positive / total,
+      percent = percent(n_positive / total, accuracy = 1),
+      stringsAsFactors = FALSE
+    )
+  })
+  do.call(rbind, rows)
+}
+
+redcap_survey_group_acceptability <- do.call(
+  rbind,
+  list(
+    survey_acceptability_by_group("Initial visit: useful or very useful", "baseline_value"),
+    survey_acceptability_by_group("Initial visit: integrated often or very often", "baseline_use"),
+    survey_acceptability_by_group("Follow-up: useful or very useful", "fu_value"),
+    survey_acceptability_by_group("Follow-up: integrated often or very often", "fu_use")
+  )
+)
+```
+
+```{r}
+#| label: response-distributions
+redcap_survey_group_plot_labels <- setNames(
+  paste0(
+    redcap_survey_group_summary$group,
+    " (n=",
+    redcap_survey_group_summary$n,
+    ")"
+  ),
+  redcap_survey_group_summary$group
+)
+
+summarize_survey_responses <- function(variable, setting, domain, labels) {
+  tab <- as.data.frame(
+    table(
+      group = redcap_staff_survey$group_label,
+      code = factor(
+        as.character(redcap_staff_survey[[variable]]),
+        levels = names(labels)
+      )
+    ),
+    stringsAsFactors = FALSE
+  )
+  names(tab)[3] <- "n"
+  tab$setting <- setting
+  tab$domain <- domain
+  tab$response <- factor(labels[as.character(tab$code)], levels = unname(labels))
+  tab$total <- redcap_survey_group_summary$n[
+    match(tab$group, redcap_survey_group_summary$group)
+  ]
+  tab$pct <- tab$n / tab$total
+  tab$group_plot_label <- factor(
+    redcap_survey_group_plot_labels[as.character(tab$group)],
+    levels = redcap_survey_group_plot_labels[survey_group_levels]
+  )
+  tab
+}
+
+redcap_survey_usefulness_summary <- do.call(
+  rbind,
+  list(
+    summarize_survey_responses(
+      "baseline_value",
+      "Initial visit",
+      "Perceived usefulness",
+      survey_usefulness_labels
+    ),
+    summarize_survey_responses(
+      "fu_value",
+      "Follow-up",
+      "Perceived usefulness",
+      survey_usefulness_labels
+    )
+  )
+)
+redcap_survey_usefulness_summary$setting <- factor(
+  redcap_survey_usefulness_summary$setting,
+  levels = c("Initial visit", "Follow-up")
+)
+
+redcap_survey_use_summary <- do.call(
+  rbind,
+  list(
+    summarize_survey_responses(
+      "baseline_use",
+      "Initial visit",
+      "Integration into consultation",
+      survey_use_labels
+    ),
+    summarize_survey_responses(
+      "fu_use",
+      "Follow-up",
+      "Integration into consultation",
+      survey_use_labels
+    )
+  )
+)
+redcap_survey_use_summary$setting <- factor(
+  redcap_survey_use_summary$setting,
+  levels = c("Initial visit", "Follow-up")
+)
+```
+
+```{r}
+#| label: save-tables
+write_parquet(redcap_survey_metadata, here(output_dir, "metadata.parquet"))
+write_parquet(redcap_survey_group_summary, here(output_dir, "group_summary.parquet"))
+write_parquet(redcap_survey_acceptability_summary, here(output_dir, "acceptability_summary.parquet"))
+write_parquet(redcap_survey_group_acceptability, here(output_dir, "group_acceptability.parquet"))
+write_parquet(redcap_survey_usefulness_summary, here(output_dir, "usefulness_response_summary.parquet"))
+write_parquet(redcap_survey_use_summary, here(output_dir, "use_response_summary.parquet"))
+```
+
+```{r}
+#| label: figures
+survey_usefulness_colors <- c(
+  "Very useful" = "#2166AC",
+  "Useful" = "#67A9CF",
+  "Slightly useful" = "#FDB863",
+  "Not useful" = "#B2182B",
+  "Do not know" = "#A6A6A6"
+)
+survey_use_colors <- c(
+  "Very often" = "#1B7837",
+  "Often" = "#7FBF7B",
+  "Rarely" = "#F1A340",
+  "Never" = "#B2182B"
+)
+
+redcap_survey_usefulness_plot <- ggplot(
+  redcap_survey_usefulness_summary,
+  aes(x = group_plot_label, y = pct, fill = response)
+) +
+  geom_col(width = 0.72, color = "white", linewidth = 0.2) +
+  coord_flip() +
+  facet_wrap(vars(setting), nrow = 1) +
+  scale_y_continuous(
+    labels = percent_format(accuracy = 1),
+    limits = c(0, 1),
+    expand = expansion(mult = c(0, 0.02))
+  ) +
+  scale_fill_manual(values = survey_usefulness_colors, drop = FALSE) +
+  labs(
+    x = NULL,
+    y = NULL,
+    fill = NULL
+  ) +
+  guides(fill = guide_legend(nrow = 2, byrow = TRUE)) +
+  theme_minimal(base_size = 11) +
+  theme(
+    legend.position = "bottom",
+    panel.spacing.x = unit(1.2, "cm"),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor = element_blank(),
+    strip.text = element_text(face = "bold"),
+    plot.background = element_rect(fill = "white", color = NA)
+  )
+
+redcap_survey_use_plot <- ggplot(
+  redcap_survey_use_summary,
+  aes(x = group_plot_label, y = pct, fill = response)
+) +
+  geom_col(width = 0.72, color = "white", linewidth = 0.2) +
+  coord_flip() +
+  facet_wrap(vars(setting), nrow = 1) +
+  scale_y_continuous(
+    labels = percent_format(accuracy = 1),
+    limits = c(0, 1),
+    expand = expansion(mult = c(0, 0.02))
+  ) +
+  scale_fill_manual(values = survey_use_colors, drop = FALSE) +
+  labs(
+    x = NULL,
+    y = NULL,
+    fill = NULL
+  ) +
+  guides(fill = guide_legend(nrow = 1, byrow = TRUE)) +
+  theme_minimal(base_size = 11) +
+  theme(
+    legend.position = "bottom",
+    panel.spacing.x = unit(1.2, "cm"),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor = element_blank(),
+    strip.text = element_text(face = "bold"),
+    plot.background = element_rect(fill = "white", color = NA)
+  )
+
+save_plot_dual(
+  redcap_survey_usefulness_plot,
+  here(figure_dir, "usefulness"),
+  width = 8,
+  height = 4
+)
+save_plot_dual(
+  redcap_survey_use_plot,
+  here(figure_dir, "integration"),
+  width = 8,
+  height = 4
+)
+```
+
+## Overall Acceptability
+
+```{r}
+redcap_survey_acceptability_table <- redcap_survey_acceptability_summary
+redcap_survey_acceptability_table$n_total <- paste0(
+  redcap_survey_acceptability_table$n,
+  "/",
+  redcap_survey_acceptability_table$total
+)
+
+redcap_survey_acceptability_table <- redcap_survey_acceptability_table[, c("metric", "n_total", "percent")]
+names(redcap_survey_acceptability_table) <- c("Survey result", "n/total", "Percent")
+
+tt(redcap_survey_acceptability_table)
+```
+
+## Group-Specific Acceptability
+
+```{r}
+redcap_survey_group_acceptability_table <- redcap_survey_group_acceptability
+redcap_survey_group_acceptability_table$n_total <- paste0(
+  redcap_survey_group_acceptability_table$n,
+  "/",
+  redcap_survey_group_acceptability_table$total
+)
+
+redcap_survey_group_acceptability_table <- redcap_survey_group_acceptability_table[
+  ,
+  c("group", "metric", "n_total", "percent")
+]
+names(redcap_survey_group_acceptability_table) <- c(
+  "Professional group",
+  "Survey result",
+  "n/total",
+  "Percent"
+)
+
+tt(redcap_survey_group_acceptability_table)
+```
+
+## Figures
+
+```{r}
+redcap_survey_usefulness_plot
+redcap_survey_use_plot
+```

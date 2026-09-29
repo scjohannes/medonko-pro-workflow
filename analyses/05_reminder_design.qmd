@@ -1,0 +1,1382 @@
+---
+title: "Reminder Design Diagnostics"
+author: "Johannes Schwenke"
+date: today
+format:
+  typst: default
+---
+
+## Overview
+
+This document reports first-contact, follow-up, and overall observed-versus-expected questionnaire handouts during the first six months after first contact. It first describes overall performance among all patients and descriptive performance among patients with reminders whose first contact occurred during the reminder period. It then presents the period-aligned and diagnosis- and period-aligned comparisons.
+
+```{r}
+#| label: setup
+library(here)
+library(arrow)
+library(tidyverse)
+library(scales)
+library(tinytable)
+library(patchwork)
+
+output_dir <- here("output", "05_reminder_design")
+figure_dir <- here(output_dir, "figures")
+followup_limit_days <- 182L
+reminder_start_label <- "May 2024"
+reminder_end_label <- "March 2026"
+
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(figure_dir, recursive = TRUE, showWarnings = FALSE)
+```
+
+```{r}
+#| label: load-data
+raw_data <- read_parquet(here("data", "clean", "analysis_data_long_2026-08-11.parquet"))
+patients <- read_parquet(here("output", "derived", "patients_baseline.parquet"))
+```
+
+## Analysis Populations
+
+The overall analysis includes all patients across the full study period. The descriptive reminder population includes patients with reminders whose first contact occurred while the reminder workflow was active, from May 1, 2024, through March 2026. The period-aligned cohort compares patients with and without reminders whose first contact occurred during this period. The diagnosis- and period-aligned cohort additionally restricts the sample to patients meeting the diagnosis-based reminder eligibility criteria. These restrictions align the populations but do not constitute exact matching.
+
+```{r}
+#| label: reminder-cohorts
+plan_elig <- c(
+  "Combined radio-chemotherapy",
+  "Primary systemic therapy alone"
+)
+
+diag_elig <- c(
+  "HEAD_NECK",
+  "LUNG",
+  "BOWEL",
+  "BILIARY_TRACT",
+  "PANCREAS",
+  "PROSTATE",
+  "SKIN",
+  "SOFT_TISSUE",
+  "STOMACH",
+  "BLADDER",
+  "KIDNEY",
+  "TESTIS",
+  "LIVER",
+  "PLEURA",
+  "THYROID",
+  "AMPULLA_OF_VATER",
+  "BONE",
+  "EYE",
+  "PENIS"
+)
+
+patient_period <- raw_data |>
+  mutate(
+    first_contact_since_intro = days_since_intro_quest - days_since_fstcnt,
+    first_contact_since_reminder_start = days_since_start_liqplat - days_since_fstcnt
+  ) |>
+  summarise(
+    reminder = first(reminder),
+    first_contact_since_intro = first(first_contact_since_intro[!is.na(first_contact_since_intro)]),
+    first_contact_since_reminder_start = first(
+      first_contact_since_reminder_start[!is.na(first_contact_since_reminder_start)]
+    ),
+    diagnosis = first(diagnosis[!is.na(diagnosis)]),
+    plan_fstcnt_coded = first(plan_fstcnt_coded[!is.na(plan_fstcnt_coded)]),
+    .by = pat_id
+  )
+
+reminder_period <- tibble(
+  period_start = 0,
+  period_end = max(patient_period$first_contact_since_reminder_start, na.rm = TRUE),
+  period_start_label = reminder_start_label,
+  period_end_label = reminder_end_label
+)
+
+period_aligned_cohort <- raw_data |>
+  left_join(
+    patient_period |>
+      select(
+        pat_id,
+        first_contact_since_intro,
+        first_contact_since_reminder_start
+      ),
+    by = "pat_id"
+  ) |>
+  filter(
+    first_contact_since_reminder_start >= reminder_period$period_start,
+    first_contact_since_reminder_start <= reminder_period$period_end
+  ) |>
+  mutate(
+    within_followup_window = !is.na(days_since_fstcnt) &
+      days_since_fstcnt > 0 &
+      days_since_fstcnt <= followup_limit_days
+  )
+
+overall_cohort <- raw_data |>
+  left_join(
+    patient_period |>
+      select(
+        pat_id,
+        first_contact_since_intro,
+        first_contact_since_reminder_start
+      ),
+    by = "pat_id"
+  ) |>
+  mutate(
+    within_followup_window = !is.na(days_since_fstcnt) &
+      days_since_fstcnt > 0 &
+      days_since_fstcnt <= followup_limit_days
+  )
+
+reminder_period_cohort <- period_aligned_cohort |>
+  filter(reminder == 1)
+
+reminder_exposure_counts <- patient_period |>
+  filter(reminder == 1) |>
+  summarise(
+    n_reminder_patients = n(),
+    n_first_contact_before_reminder_period = sum(
+      first_contact_since_reminder_start < reminder_period$period_start,
+      na.rm = TRUE
+    ),
+    n_first_contact_during_reminder_period = sum(
+      first_contact_since_reminder_start >= reminder_period$period_start &
+        first_contact_since_reminder_start <= reminder_period$period_end,
+      na.rm = TRUE
+    )
+  )
+
+period_diagnosis_treatment_plan_aligned_cohort <- period_aligned_cohort |>
+  filter(
+    plan_fstcnt_coded %in% plan_elig,
+    diagnosis %in% diag_elig
+  )
+```
+
+## Patient Flow
+
+
+```{r}
+#| label: patient-flow
+patient_flow_patients <- patient_period |>
+  mutate(
+    in_reminder_period = first_contact_since_reminder_start >= reminder_period$period_start &
+      first_contact_since_reminder_start <= reminder_period$period_end,
+    diagnosis_aligned = diagnosis %in% diag_elig,
+    treatment_plan_aligned = plan_fstcnt_coded %in% plan_elig
+  )
+
+pre_period_patients <- patient_flow_patients |>
+  filter(!in_reminder_period)
+
+period_aligned_flow_patients <- patient_flow_patients |>
+  filter(in_reminder_period)
+
+diagnosis_not_aligned_patients <- period_aligned_flow_patients |>
+  filter(!(diagnosis_aligned & treatment_plan_aligned))
+
+diagnosis_aligned_patients <- period_aligned_flow_patients |>
+  filter(diagnosis_aligned)
+
+treatment_plan_not_aligned_patients <- diagnosis_aligned_patients |>
+  filter(!treatment_plan_aligned)
+
+period_diagnosis_treatment_plan_aligned_flow_patients <-
+  diagnosis_aligned_patients |>
+  filter(treatment_plan_aligned)
+
+patient_flow_counts <- bind_rows(
+  patient_flow_patients |>
+    summarise(
+      step = "source",
+      description = "All patients in the analysis data",
+      n_patients = n(),
+      n_no_reminder = sum(reminder == 0, na.rm = TRUE),
+      n_reminder = sum(reminder == 1, na.rm = TRUE)
+    ),
+  pre_period_patients |>
+    summarise(
+      step = "excluded_pre_period",
+      description = "Excluded from period-aligned cohort: first contact before May 1, 2024",
+      n_patients = n(),
+      n_no_reminder = sum(reminder == 0, na.rm = TRUE),
+      n_reminder = sum(reminder == 1, na.rm = TRUE)
+    ),
+  period_aligned_flow_patients |>
+    summarise(
+      step = "period_aligned_cohort",
+      description = "Period-aligned cohort",
+      n_patients = n(),
+      n_no_reminder = sum(reminder == 0, na.rm = TRUE),
+      n_reminder = sum(reminder == 1, na.rm = TRUE)
+    ),
+  diagnosis_not_aligned_patients |>
+    summarise(
+      step = "diagnosis_not_aligned",
+      description = "Diagnosis not aligned with reminder eligibility criteria",
+      n_patients = n(),
+      n_no_reminder = sum(reminder == 0, na.rm = TRUE),
+      n_reminder = sum(reminder == 1, na.rm = TRUE)
+    ),
+  period_diagnosis_treatment_plan_aligned_flow_patients |>
+    summarise(
+      step = "period_diagnosis_treatment_plan_aligned",
+      description = "Diagnosis- and period-aligned cohort",
+      n_patients = n(),
+      n_no_reminder = sum(reminder == 0, na.rm = TRUE),
+      n_reminder = sum(reminder == 1, na.rm = TRUE)
+    )
+)
+```
+
+Each patient contributes one expected first-contact questionnaire opportunity at day 0. Follow-up opportunities are reconstructed separately from appointment days 1 through 182, with the schedule anchored at first contact. The main definition counts an appointment day once at least 42 days have elapsed since first contact or the previous expected opportunity. A 56-day version is also saved as a sensitivity analysis. Overall counts are the sum of first-contact and follow-up counts.
+
+```{r}
+#| label: expected-handouts
+cohort_data_sets <- list(
+  overall = overall_cohort,
+  reminder_period = reminder_period_cohort,
+  period_aligned = period_aligned_cohort,
+  period_diagnosis_treatment_plan_aligned =
+    period_diagnosis_treatment_plan_aligned_cohort
+)
+
+patient_count_sets <- vector("list", length(cohort_data_sets))
+names(patient_count_sets) <- names(cohort_data_sets)
+
+for (cohort_name in names(cohort_data_sets)) {
+  cohort_data <- cohort_data_sets[[cohort_name]] |>
+    arrange(pat_id, days_since_fstcnt, app_day)
+
+  followup_appointment_days <- cohort_data |>
+    filter(
+      !is.na(days_since_fstcnt),
+      days_since_fstcnt > 0,
+      days_since_fstcnt <= followup_limit_days
+    ) |>
+    distinct(pat_id, days_since_fstcnt) |>
+    arrange(pat_id, days_since_fstcnt) |>
+    mutate(
+      expected_42d = FALSE,
+      expected_56d = FALSE
+    )
+
+  for (patient_id in unique(followup_appointment_days$pat_id)) {
+    patient_rows <- which(followup_appointment_days$pat_id == patient_id)
+
+    last_expected_day <- 0
+    for (row_number in patient_rows) {
+      appointment_day <- followup_appointment_days$days_since_fstcnt[[row_number]]
+      if (appointment_day - last_expected_day >= 42) {
+        followup_appointment_days$expected_42d[[row_number]] <- TRUE
+        last_expected_day <- appointment_day
+      }
+    }
+
+    last_expected_day <- 0
+    for (row_number in patient_rows) {
+      appointment_day <- followup_appointment_days$days_since_fstcnt[[row_number]]
+      if (appointment_day - last_expected_day >= 56) {
+        followup_appointment_days$expected_56d[[row_number]] <- TRUE
+        last_expected_day <- appointment_day
+      }
+    }
+  }
+
+  expected_followup_counts <- followup_appointment_days |>
+    summarise(
+      expected_followup_questionnaires_42d = sum(expected_42d),
+      expected_followup_questionnaires_56d = sum(expected_56d),
+      .by = pat_id
+    )
+
+  patient_count_sets[[cohort_name]] <- cohort_data |>
+    summarise(
+      reminder = first(reminder),
+      first_contact_since_intro = first(first_contact_since_intro),
+      first_contact_since_reminder_start = first(first_contact_since_reminder_start),
+      n_appointment_records = n(),
+      n_first_contact_appointment_records = sum(days_since_fstcnt == 0, na.rm = TRUE),
+      n_followup_appointment_records = sum(
+        days_since_fstcnt > 0 & days_since_fstcnt <= followup_limit_days,
+        na.rm = TRUE
+      ),
+      n_first_contact_appointment_days = as.integer(any(days_since_fstcnt == 0, na.rm = TRUE)),
+      n_followup_appointment_days = n_distinct(
+        days_since_fstcnt[
+          !is.na(days_since_fstcnt) &
+            days_since_fstcnt > 0 &
+            days_since_fstcnt <= followup_limit_days
+        ]
+      ),
+      observed_followup_days = if (all(
+        is.na(days_since_fstcnt) |
+          days_since_fstcnt <= 0 |
+          days_since_fstcnt > followup_limit_days
+      )) {
+        NA_real_
+      } else {
+        max(
+          days_since_fstcnt[
+            !is.na(days_since_fstcnt) &
+              days_since_fstcnt > 0 &
+              days_since_fstcnt <= followup_limit_days
+          ]
+        )
+      },
+      observed_first_contact_questionnaires = sum(
+        days_since_fstcnt == 0 &
+          quest_status == 1 &
+          encounter_type %in% c(1, 2, 3) &
+          (is.na(noquestionnaire) | noquestionnaire != 4),
+        na.rm = TRUE
+      ),
+      observed_followup_questionnaires = sum(
+        days_since_fstcnt > 0 &
+          days_since_fstcnt <= followup_limit_days &
+          quest_status == 1 &
+          encounter_type %in% c(1, 2, 3) &
+          (is.na(noquestionnaire) | noquestionnaire != 4),
+        na.rm = TRUE
+      ),
+      .by = pat_id
+    ) |>
+    left_join(expected_followup_counts, by = "pat_id") |>
+    mutate(
+      expected_first_contact_questionnaires = 1L,
+      expected_followup_questionnaires_42d = replace_na(
+        expected_followup_questionnaires_42d,
+        0L
+      ),
+      expected_followup_questionnaires_56d = replace_na(
+        expected_followup_questionnaires_56d,
+        0L
+      ),
+      observed_overall_questionnaires =
+        observed_first_contact_questionnaires + observed_followup_questionnaires,
+      expected_overall_questionnaires_42d =
+        expected_first_contact_questionnaires + expected_followup_questionnaires_42d,
+      expected_overall_questionnaires_56d =
+        expected_first_contact_questionnaires + expected_followup_questionnaires_56d,
+      reminder = factor(reminder, levels = c(0, 1), labels = c("No", "Yes")),
+      analysis_window_days = followup_limit_days,
+      observed_per_expected_patient_42d = if_else(
+        expected_followup_questionnaires_42d > 0,
+        observed_followup_questionnaires / expected_followup_questionnaires_42d,
+        NA_real_
+      ),
+      observed_per_expected_patient_56d = if_else(
+        expected_followup_questionnaires_56d > 0,
+        observed_followup_questionnaires / expected_followup_questionnaires_56d,
+        NA_real_
+      ),
+      overall_observed_per_expected_patient_42d =
+        observed_overall_questionnaires / expected_overall_questionnaires_42d,
+      overall_observed_per_expected_patient_56d =
+        observed_overall_questionnaires / expected_overall_questionnaires_56d
+    ) |>
+    left_join(
+      patients |>
+        select(
+          pat_id,
+          age,
+          sex,
+          ecog_baseline = ecog_baseline_analysis,
+          diagnosis_group,
+          treatment_plan_group
+        ),
+      by = "pat_id"
+    )
+}
+
+overall_patient_counts <- patient_count_sets$overall
+reminder_period_patient_counts <- patient_count_sets$reminder_period
+period_aligned_patient_counts <- patient_count_sets$period_aligned
+period_diagnosis_treatment_plan_aligned_patient_counts <-
+  patient_count_sets$period_diagnosis_treatment_plan_aligned
+```
+
+## Follow-up Performance by Calendar Period
+
+For context, overall follow-up performance before patient-specific reminders were introduced is compared with performance during the reminder period, stratified by whether patients received reminders. Observed questionnaires and expected opportunities are classified by the calendar date of each follow-up appointment.
+
+```{r}
+#| label: followup-calendar-period-reminder
+followup_appointment_days_by_calendar_period <- overall_cohort |>
+  filter(
+    !is.na(days_since_fstcnt),
+    days_since_fstcnt > 0,
+    days_since_fstcnt <= followup_limit_days
+  ) |>
+  distinct(pat_id, reminder, days_since_fstcnt, days_since_start_liqplat) |>
+  arrange(pat_id, days_since_fstcnt) |>
+  mutate(expected_42d = FALSE)
+
+for (patient_id in unique(followup_appointment_days_by_calendar_period$pat_id)) {
+  patient_rows <- which(
+    followup_appointment_days_by_calendar_period$pat_id == patient_id
+  )
+  last_expected_day <- 0
+
+  for (row_number in patient_rows) {
+    appointment_day <-
+      followup_appointment_days_by_calendar_period$days_since_fstcnt[[row_number]]
+    if (appointment_day - last_expected_day >= 42) {
+      followup_appointment_days_by_calendar_period$expected_42d[[row_number]] <- TRUE
+      last_expected_day <- appointment_day
+    }
+  }
+}
+
+followup_observed_by_calendar_period_and_reminder <- overall_cohort |>
+  filter(
+    days_since_fstcnt > 0,
+    days_since_fstcnt <= followup_limit_days,
+    quest_status == 1,
+    encounter_type %in% c(1, 2, 3),
+    is.na(noquestionnaire) | noquestionnaire != 4
+  ) |>
+  mutate(
+    comparison_group = case_when(
+      days_since_start_liqplat < reminder_period$period_start ~
+        "Before reminders: all patients",
+      reminder == 0 ~ "Reminder period: no reminder",
+      reminder == 1 ~ "Reminder period: reminder"
+    )
+  ) |>
+  summarise(
+    observed_followup_questionnaires = n(),
+    .by = comparison_group
+  )
+
+followup_expected_by_calendar_period_and_reminder <-
+  followup_appointment_days_by_calendar_period |>
+  filter(expected_42d) |>
+  mutate(
+    comparison_group = case_when(
+      days_since_start_liqplat < reminder_period$period_start ~
+        "Before reminders: all patients",
+      reminder == 0 ~ "Reminder period: no reminder",
+      reminder == 1 ~ "Reminder period: reminder"
+    )
+  ) |>
+  summarise(
+    expected_followup_questionnaires = n(),
+    .by = comparison_group
+  )
+
+followup_by_calendar_period_and_reminder_summary <-
+  followup_observed_by_calendar_period_and_reminder |>
+  left_join(
+    followup_expected_by_calendar_period_and_reminder,
+    by = "comparison_group"
+  ) |>
+  mutate(
+    followup_observed_per_expected =
+      observed_followup_questionnaires / expected_followup_questionnaires
+  )
+```
+
+## Descriptive Performance
+
+The overall analysis describes questionnaire handout performance among all patients across the full study period. The reminder-period analysis separately describes patients with reminders whose USB trajectory began during the reminder period. Neither analysis estimates a reminder effect.
+
+```{r}
+#| label: group-summaries
+schedule_intervals <- c(42L, 56L)
+
+summary_data_sets <- list(
+  overall = overall_patient_counts |>
+    mutate(summary_group = "All patients"),
+  reminder_period = reminder_period_patient_counts |>
+    mutate(summary_group = "Reminder"),
+  period_aligned = period_aligned_patient_counts |>
+    mutate(summary_group = as.character(reminder)),
+  period_diagnosis_treatment_plan_aligned =
+    period_diagnosis_treatment_plan_aligned_patient_counts |>
+      mutate(summary_group = as.character(reminder))
+)
+handout_summary_sets <- vector("list", length(summary_data_sets))
+names(handout_summary_sets) <- names(summary_data_sets)
+
+for (summary_name in names(summary_data_sets)) {
+  summary_data <- summary_data_sets[[summary_name]]
+  interval_summaries <- vector("list", length(schedule_intervals))
+
+  for (interval_index in seq_along(schedule_intervals)) {
+    interval_days <- schedule_intervals[[interval_index]]
+    expected_col <- paste0("expected_followup_questionnaires_", interval_days, "d")
+    expected_overall_col <- paste0("expected_overall_questionnaires_", interval_days, "d")
+
+    interval_summaries[[interval_index]] <- summary_data |>
+      summarise(
+        n_patients = n(),
+        n_appointment_records = sum(n_appointment_records),
+        n_first_contact_appointment_records = sum(n_first_contact_appointment_records),
+        n_followup_appointment_records = sum(n_followup_appointment_records),
+        n_first_contact_appointment_days = sum(n_first_contact_appointment_days),
+        n_followup_appointment_days = sum(n_followup_appointment_days),
+        median_observed_followup_days = median(observed_followup_days, na.rm = TRUE),
+        observed_first_contact_questionnaires = sum(observed_first_contact_questionnaires),
+        expected_first_contact_questionnaires = sum(expected_first_contact_questionnaires),
+        first_contact_observed_per_expected =
+          observed_first_contact_questionnaires / expected_first_contact_questionnaires,
+        mean_observed_followup_per_patient = mean(observed_followup_questionnaires),
+        mean_expected_followup_per_patient = mean(.data[[expected_col]]),
+        observed_followup_questionnaires = sum(observed_followup_questionnaires),
+        expected_followup_questionnaires = sum(.data[[expected_col]]),
+        followup_observed_per_expected =
+          observed_followup_questionnaires / expected_followup_questionnaires,
+        followup_observed_per_100_expected = 100 * followup_observed_per_expected,
+        observed_overall_questionnaires = sum(observed_overall_questionnaires),
+        expected_overall_questionnaires = sum(.data[[expected_overall_col]]),
+        overall_observed_per_expected =
+          observed_overall_questionnaires / expected_overall_questionnaires,
+        overall_observed_per_100_expected = 100 * overall_observed_per_expected,
+        .by = summary_group
+      ) |>
+      mutate(interval_days = interval_days) |>
+      rename(reminder = summary_group) |>
+      relocate(interval_days, reminder)
+  }
+
+  handout_summary_sets[[summary_name]] <- bind_rows(interval_summaries)
+}
+
+period_aligned_handout_summary <- handout_summary_sets$period_aligned
+overall_handout_summary <- handout_summary_sets$overall
+reminder_period_handout_summary <- handout_summary_sets$reminder_period
+period_diagnosis_treatment_plan_aligned_handout_summary <-
+  handout_summary_sets$period_diagnosis_treatment_plan_aligned
+```
+
+## Reminder Comparison
+
+The comparison reports first-contact, follow-up, and overall handout performance separately. Overall performance includes the first-contact opportunity.
+
+```{r}
+#| label: reminder-point-contrasts
+period_aligned_point_contrasts <- period_aligned_handout_summary |>
+  select(
+    interval_days,
+    reminder,
+    first_contact = first_contact_observed_per_expected,
+    follow_up = followup_observed_per_expected,
+    overall = overall_observed_per_expected
+  ) |>
+  pivot_longer(
+    cols = c(first_contact, follow_up, overall),
+    names_to = "assessment_period",
+    values_to = "observed_per_expected"
+  ) |>
+  filter(assessment_period != "first_contact" | interval_days == 42) |>
+  pivot_wider(
+    names_from = reminder,
+    values_from = observed_per_expected,
+    names_prefix = "observed_per_expected_"
+  ) |>
+  rename(
+    observed_per_expected_no = observed_per_expected_No,
+    observed_per_expected_yes = observed_per_expected_Yes
+  ) |>
+  mutate(difference = observed_per_expected_yes - observed_per_expected_no)
+
+period_diagnosis_treatment_plan_aligned_point_contrasts <-
+  period_diagnosis_treatment_plan_aligned_handout_summary |>
+  select(
+    interval_days,
+    reminder,
+    first_contact = first_contact_observed_per_expected,
+    follow_up = followup_observed_per_expected,
+    overall = overall_observed_per_expected
+  ) |>
+  pivot_longer(
+    cols = c(first_contact, follow_up, overall),
+    names_to = "assessment_period",
+    values_to = "observed_per_expected"
+  ) |>
+  filter(assessment_period != "first_contact" | interval_days == 42) |>
+  pivot_wider(
+    names_from = reminder,
+    values_from = observed_per_expected,
+    names_prefix = "observed_per_expected_"
+  ) |>
+  rename(
+    observed_per_expected_no = observed_per_expected_No,
+    observed_per_expected_yes = observed_per_expected_Yes
+  ) |>
+  mutate(difference = observed_per_expected_yes - observed_per_expected_no)
+```
+
+```{r}
+#| label: bootstrap
+set.seed(20260621)
+
+n_bootstrap <- 5000L
+assessment_periods <- c("first_contact", "follow_up", "overall")
+
+bootstrap_data_sets <- list(
+  period_aligned = period_aligned_patient_counts,
+  period_diagnosis_treatment_plan_aligned =
+    period_diagnosis_treatment_plan_aligned_patient_counts
+)
+bootstrap_draw_sets <- vector("list", length(bootstrap_data_sets))
+names(bootstrap_draw_sets) <- names(bootstrap_data_sets)
+
+for (bootstrap_name in names(bootstrap_data_sets)) {
+  bootstrap_data <- bootstrap_data_sets[[bootstrap_name]]
+  interval_draws <- vector(
+    "list",
+    length(schedule_intervals) * length(assessment_periods)
+  )
+  draw_index <- 0L
+
+  for (interval_index in seq_along(schedule_intervals)) {
+    interval_days <- schedule_intervals[[interval_index]]
+
+    no_reminder_data <- bootstrap_data |>
+      filter(reminder == "No")
+    yes_reminder_data <- bootstrap_data |>
+      filter(reminder == "Yes")
+
+    for (assessment_period in assessment_periods) {
+      if (assessment_period == "first_contact" && interval_days != 42) {
+        next
+      }
+
+      if (assessment_period == "first_contact") {
+        observed_col <- "observed_first_contact_questionnaires"
+        expected_col <- "expected_first_contact_questionnaires"
+      } else if (assessment_period == "follow_up") {
+        observed_col <- "observed_followup_questionnaires"
+        expected_col <- paste0(
+          "expected_followup_questionnaires_",
+          interval_days,
+          "d"
+        )
+      } else {
+        observed_col <- "observed_overall_questionnaires"
+        expected_col <- paste0(
+          "expected_overall_questionnaires_",
+          interval_days,
+          "d"
+        )
+      }
+
+      no_reminder_rate <- replicate(n_bootstrap, {
+        sampled_rows <- sample.int(
+          nrow(no_reminder_data),
+          size = nrow(no_reminder_data),
+          replace = TRUE
+        )
+        sum(no_reminder_data[[observed_col]][sampled_rows]) /
+          sum(no_reminder_data[[expected_col]][sampled_rows])
+      })
+
+      yes_reminder_rate <- replicate(n_bootstrap, {
+        sampled_rows <- sample.int(
+          nrow(yes_reminder_data),
+          size = nrow(yes_reminder_data),
+          replace = TRUE
+        )
+        sum(yes_reminder_data[[observed_col]][sampled_rows]) /
+          sum(yes_reminder_data[[expected_col]][sampled_rows])
+      })
+
+      draw_index <- draw_index + 1L
+      interval_draws[[draw_index]] <- tibble(
+        iteration = seq_len(n_bootstrap),
+        interval_days = interval_days,
+        assessment_period = assessment_period,
+        observed_per_expected_no = no_reminder_rate,
+        observed_per_expected_yes = yes_reminder_rate,
+        difference = observed_per_expected_yes - observed_per_expected_no
+      )
+    }
+  }
+
+  bootstrap_draw_sets[[bootstrap_name]] <- bind_rows(interval_draws)
+}
+
+period_aligned_bootstrap_draws <- bootstrap_draw_sets$period_aligned
+period_diagnosis_treatment_plan_aligned_bootstrap_draws <-
+  bootstrap_draw_sets$period_diagnosis_treatment_plan_aligned
+
+period_aligned_bootstrap_intervals <- period_aligned_bootstrap_draws |>
+  summarise(
+    difference_conf.low = quantile(difference, 0.025, na.rm = TRUE),
+    difference_conf.high = quantile(difference, 0.975, na.rm = TRUE),
+    .by = c(interval_days, assessment_period)
+  )
+
+period_diagnosis_treatment_plan_aligned_bootstrap_intervals <-
+  period_diagnosis_treatment_plan_aligned_bootstrap_draws |>
+  summarise(
+    difference_conf.low = quantile(difference, 0.025, na.rm = TRUE),
+    difference_conf.high = quantile(difference, 0.975, na.rm = TRUE),
+    .by = c(interval_days, assessment_period)
+  )
+
+period_aligned_handout_contrast <- period_aligned_point_contrasts |>
+  left_join(
+    period_aligned_bootstrap_intervals,
+    by = c("interval_days", "assessment_period")
+  )
+
+period_diagnosis_treatment_plan_aligned_handout_contrast <-
+  period_diagnosis_treatment_plan_aligned_point_contrasts |>
+  left_join(
+    period_diagnosis_treatment_plan_aligned_bootstrap_intervals,
+    by = c("interval_days", "assessment_period")
+  )
+
+contrast_summary_data_sets <- list(
+  "Period-aligned cohort" = period_aligned_handout_summary,
+  "Diagnosis- and period-aligned cohort" =
+    period_diagnosis_treatment_plan_aligned_handout_summary
+)
+contrast_data_sets <- list(
+  "Period-aligned cohort" = period_aligned_handout_contrast,
+  "Diagnosis- and period-aligned cohort" =
+    period_diagnosis_treatment_plan_aligned_handout_contrast
+)
+contrast_summary_parts <- vector("list", length(contrast_summary_data_sets))
+
+for (population_index in seq_along(contrast_summary_data_sets)) {
+  population <- names(contrast_summary_data_sets)[[population_index]]
+  summary_data <- contrast_summary_data_sets[[population_index]]
+  contrast_data <- contrast_data_sets[[population_index]]
+
+  group_counts <- bind_rows(
+    summary_data |>
+      select(
+        interval_days,
+        reminder,
+        n_patients,
+        observed_questionnaires = observed_first_contact_questionnaires,
+        expected_questionnaires = expected_first_contact_questionnaires
+      ) |>
+      mutate(assessment_period = "first_contact"),
+    summary_data |>
+      select(
+        interval_days,
+        reminder,
+        n_patients,
+        observed_questionnaires = observed_followup_questionnaires,
+        expected_questionnaires = expected_followup_questionnaires
+      ) |>
+      mutate(assessment_period = "follow_up"),
+    summary_data |>
+      select(
+        interval_days,
+        reminder,
+        n_patients,
+        observed_questionnaires = observed_overall_questionnaires,
+        expected_questionnaires = expected_overall_questionnaires
+      ) |>
+      mutate(assessment_period = "overall")
+  ) |>
+    mutate(
+      reminder_key = case_when(
+        reminder == "No" ~ "no",
+        reminder == "Yes" ~ "yes"
+      )
+    ) |>
+    select(
+      interval_days,
+      assessment_period,
+      reminder_key,
+      n_patients,
+      observed_questionnaires,
+      expected_questionnaires
+    ) |>
+    pivot_wider(
+      names_from = reminder_key,
+      values_from = c(
+        n_patients,
+        observed_questionnaires,
+        expected_questionnaires
+      ),
+      names_glue = "{.value}_{reminder_key}"
+    )
+
+  contrast_summary_parts[[population_index]] <- contrast_data |>
+    left_join(
+      group_counts,
+      by = c("interval_days", "assessment_period")
+    ) |>
+    mutate(population = population, .before = 1)
+}
+
+reminder_contrast_summary <- bind_rows(contrast_summary_parts)
+```
+
+```{r}
+#| label: period-summary
+period_summary <- period_aligned_patient_counts |>
+  summarise(
+    n_patients = dplyr::n(),
+    .by = reminder
+  ) |>
+  mutate(
+    period_start_day = reminder_period$period_start,
+    period_end_day = reminder_period$period_end,
+    period_start_label = reminder_period$period_start_label,
+    period_end_label = reminder_period$period_end_label
+  )
+```
+
+```{r}
+#| label: save-results
+write_parquet(overall_patient_counts, here(output_dir, "overall_patient_counts.parquet"))
+write_parquet(
+  overall_handout_summary,
+  here(output_dir, "overall_handout_summary.parquet")
+)
+write_parquet(
+  reminder_period_patient_counts,
+  here(output_dir, "reminder_period_patient_counts.parquet")
+)
+write_parquet(
+  reminder_period_handout_summary,
+  here(output_dir, "reminder_period_handout_summary.parquet")
+)
+write_parquet(
+  reminder_exposure_counts,
+  here(output_dir, "reminder_exposure_counts.parquet")
+)
+write_parquet(
+  followup_by_calendar_period_and_reminder_summary,
+  here(output_dir, "followup_by_calendar_period_and_reminder_summary.parquet")
+)
+write_parquet(
+  period_aligned_patient_counts,
+  here(output_dir, "period_aligned_patient_counts.parquet")
+)
+write_parquet(patient_flow_counts, here(output_dir, "patient_flow_counts.parquet"))
+write_parquet(period_summary, here(output_dir, "period_summary.parquet"))
+write_parquet(
+  period_aligned_handout_summary,
+  here(output_dir, "period_aligned_handout_summary.parquet")
+)
+write_parquet(
+  period_aligned_handout_contrast,
+  here(output_dir, "period_aligned_handout_contrast.parquet")
+)
+write_parquet(
+  reminder_contrast_summary,
+  here(output_dir, "reminder_contrast_summary.parquet")
+)
+write_parquet(
+  period_aligned_bootstrap_draws,
+  here(output_dir, "period_aligned_handout_bootstrap_draws.parquet")
+)
+write_parquet(
+  period_diagnosis_treatment_plan_aligned_patient_counts,
+  here(output_dir, "period_diagnosis_treatment_plan_aligned_patient_counts.parquet")
+)
+write_parquet(
+  period_diagnosis_treatment_plan_aligned_handout_summary,
+  here(output_dir, "period_diagnosis_treatment_plan_aligned_handout_summary.parquet")
+)
+write_parquet(
+  period_diagnosis_treatment_plan_aligned_handout_contrast,
+  here(output_dir, "period_diagnosis_treatment_plan_aligned_handout_contrast.parquet")
+)
+write_parquet(
+  period_diagnosis_treatment_plan_aligned_bootstrap_draws,
+  here(output_dir, "period_diagnosis_treatment_plan_aligned_handout_bootstrap_draws.parquet")
+)
+```
+
+```{r}
+#| label: plot-observed-expected
+observed_expected_period_aligned_data <- period_aligned_patient_counts |>
+  count(
+    reminder,
+    expected_questionnaires = expected_overall_questionnaires_42d,
+    observed_questionnaires = observed_overall_questionnaires,
+    name = "n_patients"
+  ) |>
+  mutate(
+    reminder_group_n = sum(n_patients),
+    patient_share = n_patients / reminder_group_n,
+    .by = reminder
+  )
+observed_expected_fully_aligned_data <-
+  period_diagnosis_treatment_plan_aligned_patient_counts |>
+  count(
+    reminder,
+    expected_questionnaires = expected_overall_questionnaires_42d,
+    observed_questionnaires = observed_overall_questionnaires,
+    name = "n_patients"
+  ) |>
+  mutate(
+    reminder_group_n = sum(n_patients),
+    patient_share = n_patients / reminder_group_n,
+    .by = reminder
+  )
+
+observed_expected_axis_limit <- max(
+  observed_expected_period_aligned_data$expected_questionnaires,
+  observed_expected_period_aligned_data$observed_questionnaires,
+  observed_expected_fully_aligned_data$expected_questionnaires,
+  observed_expected_fully_aligned_data$observed_questionnaires
+)
+
+# Use one relative size scale across panels. Bubble area represents the share
+# of patients within each reminder group, so unequal group sizes do not
+# dominate the visual comparison.
+observed_expected_size_limit <- max(
+  observed_expected_period_aligned_data$patient_share,
+  observed_expected_fully_aligned_data$patient_share
+)
+observed_expected_size_display_limit <- ceiling(
+  observed_expected_size_limit * 20
+) / 20
+observed_expected_size_breaks <- pretty(
+  c(0, observed_expected_size_display_limit),
+  n = 4
+)
+observed_expected_size_breaks <- observed_expected_size_breaks[
+  observed_expected_size_breaks > 0 &
+    observed_expected_size_breaks <= observed_expected_size_display_limit
+]
+
+observed_expected_period_aligned_plot <- observed_expected_period_aligned_data |>
+  ggplot(aes(
+    x = expected_questionnaires,
+    y = observed_questionnaires,
+    color = reminder,
+    size = patient_share
+  )) +
+  geom_abline(slope = 1, intercept = 0, linetype = 2, color = "grey55") +
+  geom_point(alpha = 0.75) +
+  scale_color_manual(values = c("No" = "#4D4D4D", "Yes" = "#2C7FB8")) +
+  scale_size_area(
+    max_size = 9,
+    breaks = observed_expected_size_breaks,
+    limits = c(0, observed_expected_size_display_limit),
+    labels = label_percent(accuracy = 1)
+  ) +
+  scale_x_continuous(breaks = 0:observed_expected_axis_limit) +
+  scale_y_continuous(breaks = 0:observed_expected_axis_limit) +
+  coord_equal(
+    xlim = c(-0.25, observed_expected_axis_limit + 0.5),
+    ylim = c(-0.25, observed_expected_axis_limit + 0.5)
+  ) +
+  labs(
+    title = "Period-aligned cohort",
+    x = "Expected questionnaires (including first contact)",
+    y = "Observed questionnaires (including first contact)",
+    color = "Reminder",
+    size = "Share of reminder group"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    legend.position = "bottom",
+    plot.title = element_text(size = 11, face = "bold")
+  )
+
+observed_expected_fully_aligned_plot <- observed_expected_fully_aligned_data |>
+  ggplot(aes(
+    x = expected_questionnaires,
+    y = observed_questionnaires,
+    color = reminder,
+    size = patient_share
+  )) +
+  geom_abline(slope = 1, intercept = 0, linetype = 2, color = "grey55") +
+  geom_point(alpha = 0.75) +
+  scale_color_manual(values = c("No" = "#4D4D4D", "Yes" = "#2C7FB8")) +
+  scale_size_area(
+    max_size = 9,
+    breaks = observed_expected_size_breaks,
+    limits = c(0, observed_expected_size_display_limit),
+    labels = label_percent(accuracy = 1)
+  ) +
+  scale_x_continuous(breaks = 0:observed_expected_axis_limit) +
+  scale_y_continuous(breaks = 0:observed_expected_axis_limit) +
+  coord_equal(
+    xlim = c(-0.25, observed_expected_axis_limit + 0.5),
+    ylim = c(-0.25, observed_expected_axis_limit + 0.5)
+  ) +
+  labs(
+    title = "Diagnosis- and period-aligned cohort",
+    x = "Expected questionnaires (including first contact)",
+    y = "Observed questionnaires (including first contact)",
+    color = "Reminder",
+    size = "Share of reminder group"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    legend.position = "bottom",
+    plot.title = element_text(size = 11, face = "bold")
+  )
+
+observed_expected_plot <- observed_expected_period_aligned_plot +
+  observed_expected_fully_aligned_plot +
+  plot_layout(guides = "collect") +
+  plot_annotation(tag_levels = "A", tag_suffix = ")") &
+  theme(legend.position = "bottom")
+
+ggsave(
+  here(figure_dir, "observed_expected_questionnaires.png"),
+  observed_expected_plot,
+  width = 10,
+  height = 4.8,
+  dpi = 300,
+  bg = "white"
+)
+ggsave(
+  here(figure_dir, "observed_expected_questionnaires.svg"),
+  observed_expected_plot,
+  width = 10,
+  height = 4.8,
+  bg = "white"
+)
+```
+
+```{r}
+#| label: plot-patient-flow
+flow_nodes <- tibble(
+  node = c(
+    "source",
+    "excluded_pre_period",
+    "period_aligned_cohort",
+    "diagnosis_not_aligned",
+    "period_diagnosis_treatment_plan_aligned"
+  ),
+  xmin = c(1.05, 5.15, 1.05, 5.15, 1.05),
+  xmax = c(4.45, 8.95, 4.45, 8.95, 4.45),
+  ymin = c(3.15, 2.90, 1.70, 1.60, 0.25),
+  ymax = c(3.70, 3.95, 2.70, 2.70, 1.40),
+  title = c(
+    "All patients in analysis data",
+    "Excluded: first contact\nbefore May 1, 2024",
+    "Period-aligned cohort",
+    "Diagnosis not aligned with\nreminder eligibility criteria",
+    "Diagnosis- and period-aligned cohort"
+  ),
+  include_groups = c(
+    FALSE,
+    TRUE,
+    TRUE,
+    TRUE,
+    TRUE
+  ),
+  fill = c(
+    "#F2F4F7",
+    "#F7E6D5",
+    "#DCEBFA",
+    "#F7E6D5",
+    "#DCEBFA"
+  )
+) |>
+  left_join(
+    patient_flow_counts |>
+      select(step, n_patients, n_no_reminder, n_reminder),
+    by = c("node" = "step")
+  ) |>
+  mutate(
+    x = (xmin + xmax) / 2,
+    y = (ymin + ymax) / 2,
+    label = paste0(
+      title,
+      "\nn = ",
+      n_patients,
+      if_else(
+        include_groups,
+        paste0(
+          "\nNo reminder: ",
+          n_no_reminder,
+          "\nReminder: ",
+          n_reminder
+        ),
+        ""
+      )
+    )
+  )
+
+flow_node <- function(node_name) {
+  flow_nodes |>
+    filter(node == node_name) |>
+    slice(1)
+}
+
+source_node <- flow_node("source")
+pre_period_node <- flow_node("excluded_pre_period")
+period_node <- flow_node("period_aligned_cohort")
+diagnosis_exclusion_node <- flow_node("diagnosis_not_aligned")
+final_node <- flow_node("period_diagnosis_treatment_plan_aligned")
+
+flow_edges <- bind_rows(
+  tibble(
+    x = source_node$x,
+    y = source_node$ymin,
+    xend = period_node$x,
+    yend = period_node$ymax
+  ),
+  tibble(
+    x = source_node$xmax,
+    y = source_node$y,
+    xend = pre_period_node$xmin,
+    yend = source_node$y
+  ),
+  tibble(
+    x = period_node$x,
+    y = period_node$ymin,
+    xend = final_node$x,
+    yend = final_node$ymax
+  ),
+  tibble(
+    x = period_node$xmax,
+    y = period_node$y,
+    xend = diagnosis_exclusion_node$xmin,
+    yend = period_node$y
+  )
+)
+
+patient_flow_plot <- ggplot() +
+  geom_segment(
+    data = flow_edges,
+    aes(x = x, y = y, xend = xend, yend = yend),
+    linewidth = 0.45,
+    lineend = "round",
+    arrow = grid::arrow(length = grid::unit(0.07, "inches"), type = "closed")
+  ) +
+  geom_rect(
+    data = flow_nodes,
+    aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax, fill = fill),
+    color = "#1F2933",
+    linewidth = 0.4
+  ) +
+  geom_text(
+    data = flow_nodes,
+    aes(x = x, y = y, label = label),
+    size = 3.05,
+    lineheight = 1.0,
+    color = "#1F2933"
+  ) +
+  scale_fill_identity() +
+  coord_cartesian(
+    xlim = c(0.85, 9.15),
+    ylim = c(0.05, 4.15),
+    expand = FALSE,
+    clip = "off"
+  ) +
+  theme_void(base_size = 11) +
+  theme(
+    plot.margin = margin(12, 12, 12, 12),
+    plot.background = element_rect(fill = "white", color = NA)
+  )
+
+ggsave(
+  here(figure_dir, "reminder_patient_flow.png"),
+  patient_flow_plot,
+  width = 7.2,
+  height = 3.6,
+  dpi = 300,
+  bg = "white"
+)
+ggsave(
+  here(figure_dir, "reminder_patient_flow.svg"),
+  patient_flow_plot,
+  width = 7.2,
+  height = 3.6,
+  bg = "white"
+)
+```
+
+```{r}
+#| label: design-note
+period_aligned_contrast_42d <- period_aligned_handout_contrast |>
+  filter(interval_days == 42)
+
+design_note <- c(
+  "# Reminder handout analysis note",
+  "",
+  "- Reminder exposure was not randomized.",
+  paste0(
+    "- The period-aligned cohort includes patients with and without reminders whose first contact was between ",
+    reminder_period$period_start_label,
+    " and ",
+    reminder_period$period_end_label,
+    "."
+  ),
+  "- Three patients with reminders had first contact before May 1, 2024 and are not part of the period-aligned cohort.",
+  "- The period restriction is intended to reduce confounding by calendar time, including changing staff experience, routines, and personnel.",
+  "- First contact is day 0 and contributes one expected questionnaire opportunity per patient.",
+  "- Follow-up counts use appointment days 1 through 182 after first contact; the due schedule remains anchored at first contact.",
+  "- Overall counts equal first-contact plus follow-up counts.",
+  "- The main denominator uses a 42-day minimum interval and includes the first-contact opportunity.",
+  "- Observed first-contact and follow-up counts are valid recorded questionnaire handouts, excluding technical failures.",
+  "- The period-aligned comparison uses aggregate observed/expected percentages by reminder group.",
+  "- The diagnosis- and period-aligned cohort additionally restricts the sample to patients meeting the diagnosis-based reminder eligibility criteria.",
+  "- Uncertainty is quantified with a nonparametric bootstrap resampling patients within reminder groups.",
+  "- A causal interpretation requires that remaining patient-selection or workflow differences would not plausibly explain a contrast of this size."
+)
+
+writeLines(design_note, here(output_dir, "design_note.md"), useBytes = TRUE)
+```
+
+## Descriptive Summaries
+
+```{r}
+overall_table <- overall_handout_summary |>
+  filter(interval_days == 42) |>
+  mutate(
+    first_contact_observed_per_expected = percent(
+      first_contact_observed_per_expected,
+      accuracy = 0.1
+    ),
+    followup_observed_per_expected = percent(
+      followup_observed_per_expected,
+      accuracy = 0.1
+    ),
+    overall_observed_per_expected = percent(
+      overall_observed_per_expected,
+      accuracy = 0.1
+    ),
+    mean_observed_followup_per_patient = round(mean_observed_followup_per_patient, 1),
+    mean_expected_followup_per_patient = round(mean_expected_followup_per_patient, 1)
+  ) |>
+  select(
+    reminder,
+    n_patients,
+    n_first_contact_appointment_days,
+    observed_first_contact_questionnaires,
+    expected_first_contact_questionnaires,
+    first_contact_observed_per_expected,
+    n_followup_appointment_days,
+    observed_followup_questionnaires,
+    expected_followup_questionnaires,
+    followup_observed_per_expected,
+    observed_overall_questionnaires,
+    expected_overall_questionnaires,
+    overall_observed_per_expected,
+    mean_observed_followup_per_patient,
+    mean_expected_followup_per_patient
+  )
+
+tt(
+  overall_table,
+  caption = "Overall questionnaire handout performance among all patients across the full study period. First-contact, follow-up, and overall results use the 42-day due definition."
+)
+```
+
+```{r}
+reminder_period_table <- reminder_period_handout_summary |>
+  filter(interval_days == 42) |>
+  mutate(
+    first_contact_observed_per_expected = percent(
+      first_contact_observed_per_expected,
+      accuracy = 0.1
+    ),
+    followup_observed_per_expected = percent(
+      followup_observed_per_expected,
+      accuracy = 0.1
+    ),
+    overall_observed_per_expected = percent(
+      overall_observed_per_expected,
+      accuracy = 0.1
+    ),
+    mean_observed_followup_per_patient = round(mean_observed_followup_per_patient, 1),
+    mean_expected_followup_per_patient = round(mean_expected_followup_per_patient, 1)
+  ) |>
+  select(
+    reminder,
+    n_patients,
+    n_first_contact_appointment_days,
+    observed_first_contact_questionnaires,
+    expected_first_contact_questionnaires,
+    first_contact_observed_per_expected,
+    n_followup_appointment_days,
+    observed_followup_questionnaires,
+    expected_followup_questionnaires,
+    followup_observed_per_expected,
+    observed_overall_questionnaires,
+    expected_overall_questionnaires,
+    overall_observed_per_expected,
+    mean_observed_followup_per_patient,
+    mean_expected_followup_per_patient
+  )
+
+tt(
+  reminder_period_table,
+  caption = "Questionnaire handout performance among patients with reminders whose first contact occurred during the reminder period. First-contact, follow-up, and overall results use the 42-day due definition."
+)
+```
+
+## Reminder Comparison Summaries
+
+```{r}
+period_aligned_contrast_table <- period_aligned_handout_contrast |>
+  mutate(
+    assessment_period = recode(
+      assessment_period,
+      first_contact = "First contact",
+      follow_up = "Follow-up",
+      overall = "Overall"
+    ),
+    observed_per_expected_no = percent(observed_per_expected_no, accuracy = 0.1),
+    observed_per_expected_yes = percent(observed_per_expected_yes, accuracy = 0.1),
+    difference = percent(difference, accuracy = 0.1),
+    difference_ci = paste0(
+      percent(difference_conf.low, accuracy = 0.1),
+      " to ",
+      percent(difference_conf.high, accuracy = 0.1)
+    )
+  ) |>
+  select(
+    interval_days,
+    assessment_period,
+    observed_per_expected_no,
+    observed_per_expected_yes,
+    difference,
+    difference_ci
+  )
+
+tt(
+  period_aligned_contrast_table,
+  caption = "Bootstrap contrast in observed/expected questionnaire handouts for the period-aligned cohort."
+)
+```
+
+```{r}
+period_diagnosis_treatment_plan_aligned_contrast_table <-
+  period_diagnosis_treatment_plan_aligned_handout_contrast |>
+  mutate(
+    assessment_period = recode(
+      assessment_period,
+      first_contact = "First contact",
+      follow_up = "Follow-up",
+      overall = "Overall"
+    ),
+    observed_per_expected_no = percent(observed_per_expected_no, accuracy = 0.1),
+    observed_per_expected_yes = percent(observed_per_expected_yes, accuracy = 0.1),
+    difference = percent(difference, accuracy = 0.1),
+    difference_ci = paste0(
+      percent(difference_conf.low, accuracy = 0.1),
+      " to ",
+      percent(difference_conf.high, accuracy = 0.1)
+    )
+  ) |>
+  select(
+    interval_days,
+    assessment_period,
+    observed_per_expected_no,
+    observed_per_expected_yes,
+    difference,
+    difference_ci
+  )
+
+tt(
+  period_diagnosis_treatment_plan_aligned_contrast_table,
+  caption = "Bootstrap contrast in observed/expected questionnaire handouts for the diagnosis- and period-aligned cohort."
+)
+```
+
+## Figure
+
+```{r}
+observed_expected_plot
+```

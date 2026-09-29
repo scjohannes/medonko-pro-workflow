@@ -1,0 +1,1096 @@
+---
+title: "Missingness Models (Binary Outcome)"
+author: "Johannes Schwenke"
+date: today
+format:
+  typst: default
+---
+
+{{<pagebreak>}}
+
+## Overview
+
+This document models questionnaire-level non-structural missingness as a binary outcome: any missing non-structural item (`any_missing_nonstructural = 1`) versus fully complete questionnaire (`0`).
+
+1.  **Use a fixed logit link** (`family = "logistic"`).
+2.  **Describe the full model** with LR-based ANOVA (`processMI` pooled across imputations), partial-effect plots, and odds-ratio summaries.
+3.  **Predicted event probabilities**
+4.  **MI-integrated bootstrap validation and calibration** of the prespecified full model using patient-level cluster resampling inside `fit.mult.impute(fun = ...)`, with optimism-corrected results averaged over imputations via `processMI()`.
+
+The model is `rms::lrm()`, pooled over all multiply imputed datasets using `Hmisc::fit.mult.impute()` with Rubin's rules. Patient-level covariates are imputed at the patient level; the `dtrans` mechanism expands each completed patient dataset to questionnaire-level rows by joining to a fixed questionnaire template.
+
+```{r}
+#| label: setup
+library(here)
+library(arrow)
+library(Hmisc)
+library(rms)
+library(mice)
+library(tidyverse)
+library(tinytable)
+library(scales)
+library(patchwork)
+
+source(here("R", "io.R"))
+
+followup_limit_days <- 182L
+
+ensure_dir(here("output", "03_missingness_models_binary"))
+ensure_dir(here("output", "03_missingness_models_binary", "figures"))
+```
+
+### Helper functions
+
+```{r}
+#| label: helpers
+
+# ── Data preparation ──────────────────────────────────────────────────────────
+# The questionnaire template is the fixed, fully observed questionnaire-level
+# dataset (one row per questionnaire). It carries all questionnaire-level
+# variables (phase, form_type, reminder, days_since_first_contact, age, sex,
+# and prop_missing_nonstructural). This binary analysis adds
+# any_missing_nonstructural = I(prop_missing_nonstructural > 0).
+# Patient-level covariates that were
+# multiply imputed (ecog_baseline, diagnosis_group, treatment_plan_group)
+# are joined in separately from each completed patient dataset.
+
+make_questionnaire_template <- function() {
+  read_parquet(here("output", "derived", "questionnaires.parquet")) |>
+    filter(
+      !is.na(days_since_first_contact),
+      days_since_first_contact >= 0,
+      days_since_first_contact <= followup_limit_days
+    ) |>
+    select(-any_of(c("ecog_baseline", "diagnosis_group", "treatment_plan_group"))) |>
+    mutate(
+      pat_id = as.character(.data$pat_id),
+      phase = factor(
+        if_else(.data$questionnaire_number == 1L, "baseline", "follow_up"),
+        levels = c("baseline", "follow_up")
+      ),
+      form_type = factor(.data$form_type, levels = c("long_version", "short_version")),
+      sex = factor(.data$sex),
+      reminder = factor(.data$reminder),
+      any_missing_nonstructural = as.integer(.data$prop_missing_nonstructural > 0)
+    ) |>
+    mutate(across(where(is.factor), droplevels))
+}
+
+join_patient_covariates <- function(completed_patients, questionnaire_template) {
+  patient_covariates <- completed_patients |>
+    mutate(
+      pat_id = as.character(.data$pat_id),
+      ecog_baseline = factor(as.character(.data$ecog_baseline), levels = c("0", "1", "2", "3+")),
+      diagnosis_group = factor(.data$diagnosis_group),
+      treatment_plan_group = factor(.data$treatment_plan_group)
+    ) |>
+    select("pat_id", "ecog_baseline", "diagnosis_group", "treatment_plan_group")
+
+  questionnaire_template |>
+    left_join(patient_covariates, by = "pat_id")
+}
+
+# ── Model fitting ─────────────────────────────────────────────────────────────
+
+fit_lrm_reference <- function(formula, questionnaire_data) {
+  # Fits a single lrm() on one completed dataset. Used for link-family
+  # diagnostics and for the bootstrap validation section.
+  dd <- datadist(questionnaire_data)
+  assign("dd_missingness_models", dd, envir = .GlobalEnv)
+  options(datadist = "dd_missingness_models")
+
+  fit <- lrm(
+    formula = formula,
+    data = questionnaire_data,
+    x = TRUE,
+    y = TRUE
+  )
+
+  list(fit = fit, data = questionnaire_data)
+}
+
+fit_lrm_mi <- function(formula, lrt, questionnaire_template, mids_obj,
+                       fun = NULL) {
+  # Fits lrm() pooled over all imputations via fit.mult.impute().
+  #
+  # 1. fit.mult.impute() iterates i = 1..m over the mids object.
+  # 2. For each i it calls mice::complete(mids_obj, i) to get a completed
+  #    patient-level dataset.
+  # 3. It then passes that completed dataset through `dtrans`, which joins
+  #    it to the fixed questionnaire template to produce the questionnaire-
+  #    level modelling data.
+  # 4. lrm() is fitted on each expanded dataset.
+  # 5. Coefficients and (robust, clustered) variance estimates are pooled
+  #    via Rubin's rules (method = "ordinary").
+  #
+  # When lrt = TRUE, fit.mult.impute() internally overrides method to
+  # "stack" so that processMI(..., which = "anova") can pool LR tests.
+  # The robust sandwich variance (clustered by pat_id) is used for the
+  # Wald-based pooled inference; the LR tests use the log-likelihood
+  # directly.
+  #
+  # When fun is provided (e.g., a function returning validate() results),
+  # it is passed through to fit.mult.impute() so that validate() runs
+  # inside each imputation loop. The results can then be averaged via
+  # processMI(fit, "validate").
+  #
+  # Note: the `data` argument is ignored when xtrans is a mids object;
+  # completed data comes from mice::complete(). We pass the original
+  # incomplete data only to satisfy the function signature.
+
+  reference_data <- join_patient_covariates(
+    mice::complete(mids_obj, 1),
+    questionnaire_template
+  )
+  dd <- datadist(reference_data)
+  assign("dd_missingness_models", dd, envir = .GlobalEnv)
+  options(datadist = "dd_missingness_models")
+
+  dtrans <- function(d) {
+    join_patient_covariates(
+      completed_patients = d,
+      questionnaire_template = questionnaire_template
+    )
+  }
+
+  fmi_args <- list(
+    formula = formula,
+    fitter = lrm,
+    xtrans = mids_obj,
+    data = mids_obj$data,
+    n.impute = mids_obj$m,
+    dtrans = dtrans,
+    robust = TRUE,
+    cluster = questionnaire_template$pat_id,
+    method = "ordinary",
+    lrt = lrt,
+    pr = FALSE,
+    fitargs = list(
+      x = TRUE,
+      y = TRUE
+    )
+  )
+
+  if (!is.null(fun)) fmi_args$fun <- fun
+
+  do.call(fit.mult.impute, fmi_args)
+}
+
+# ── Predicted probabilities by grid ──────────────────────────────────────────
+
+predict_event_probabilities <- function(model, newdata, by = NULL,
+                                        n_sim = 10000, conf_level = 0.95,
+                                        seed = 0322026) {
+  # Conditional Pr(Y = 1 | X), with intervals from MVN simulation of the
+  # pooled coefficients and covariance in the fit.mult.impute object.
+  predictor_names <- model[["Design"]][["name"]]
+  prediction_data <- as_tibble(newdata) |>
+    select(all_of(predictor_names))
+  design_matrix <- predict(
+    model,
+    newdata = as.data.frame(prediction_data),
+    type = "x"
+  )
+  if (is.null(dim(design_matrix))) {
+    design_matrix <- matrix(design_matrix, nrow = 1)
+  } else {
+    design_matrix <- as.matrix(design_matrix)
+  }
+
+  beta_hat <- coef(model)
+  slope_idx <- seq_along(beta_hat)[-1]
+  eta_hat <- as.numeric(beta_hat[1] + design_matrix %*% beta_hat[slope_idx])
+
+  set.seed(seed)
+  beta_sim <- MASS::mvrnorm(n_sim, beta_hat, model$var)
+  eta_sim <- sweep(
+    design_matrix %*% t(beta_sim[, slope_idx, drop = FALSE]),
+    2,
+    beta_sim[, 1],
+    "+"
+  )
+  prob_sim <- plogis(eta_sim)
+  alpha <- 1 - conf_level
+
+  prediction_data |>
+    mutate(
+      estimate = plogis(eta_hat),
+      std.error = apply(prob_sim, 1, sd),
+      conf.low = apply(prob_sim, 1, quantile, probs = alpha / 2, names = FALSE),
+      conf.high = apply(prob_sim, 1, quantile, probs = 1 - alpha / 2, names = FALSE)
+    )
+}
+
+format_prediction_reference <- function(model, exclude = character()) {
+  adjust_to <- model[["Design"]][["limits"]]["Adjust to", , drop = FALSE]
+  values <- as.list(adjust_to[1, ])
+  form_type <- as.character(values$form_type)
+  form_label <- case_when(
+    form_type == "long_version" ~ "long form",
+    form_type == "short_version" ~ "short form",
+    TRUE ~ str_replace_all(form_type, "_", " ")
+  )
+  labels <- c(
+    age = paste0("age ", values$age),
+    sex = tolower(as.character(values$sex)),
+    language = as.character(values$language),
+    marital_status = tolower(as.character(values$marital_status)),
+    ecog_baseline = paste0("ECOG ", as.character(values$ecog_baseline)),
+    form_type = form_label
+  )
+
+  paste0("Fixed: ", paste(labels[setdiff(names(labels), exclude)], collapse = ", "))
+}
+
+# ── MI-pooled no-bin calibration ──────────────────────────────────────────────
+# Each imputation is validated and calibrated separately using a patient-level
+# cluster bootstrap, then the results are averaged with rms::processMI().
+
+make_validation_fun <- function(patient_ids, B) {
+  patient_ids <- as.character(patient_ids)
+
+  if (anyNA(patient_ids)) {
+    stop("patient_ids contains missing values.")
+  }
+
+  function(fit) {
+    n_model_rows <- nrow(fit$x)
+    if (length(patient_ids) != n_model_rows) {
+      stop(
+        "patient_ids has length ", length(patient_ids),
+        ", but the fitted model contains ", n_model_rows, " rows."
+      )
+    }
+
+    con <- file(nullfile(), open = "wt")
+    sink(con, type = "message")
+    on.exit({ sink(type = "message"); close(con) }, add = TRUE)
+
+    list(
+      validate = validate(
+        fit,
+        B = B,
+        bw = FALSE,
+        estimates = FALSE,
+        pr = FALSE,
+        cluster = patient_ids
+      ),
+      calibrate = calibrate(
+        fit,
+        B = B,
+        bw = FALSE,
+        estimates = FALSE,
+        pr = FALSE,
+        smoother = "lowess",
+        cluster = patient_ids
+      )
+    )
+  }
+}
+
+tidy_calibration_curve <- function(calibration, imputation) {
+  unclass(calibration) |>
+    as_tibble() |>
+    mutate(
+      .imp = as.integer(imputation),
+      predicted = as.numeric(.data$predy),
+      apparent = as.numeric(.data$calibrated.orig),
+      optimism_corrected = as.numeric(.data$calibrated.corrected),
+      corrected_lower = as.numeric(.data$predy + .data$Lower),
+      corrected_upper = as.numeric(.data$predy + .data$Upper),
+      successful_resamples = as.integer(.data$n),
+      .before = 1
+    ) |>
+    select(
+      ".imp", "predicted", "apparent", "optimism_corrected",
+      "corrected_lower", "corrected_upper", "optimism",
+      "successful_resamples"
+    )
+}
+
+build_mi_bootstrap_calibration <- function(fit_mi) {
+  calibrations <- lapply(fit_mi$funresults, `[[`, "calibrate")
+  if (length(calibrations) != fit_mi$n.impute || any(vapply(
+    calibrations,
+    is.null,
+    logical(1)
+  ))) {
+    stop("Each imputation must contain a calibrate result.")
+  }
+
+  averaged <- processMI(fit_mi, "calibrate", plotall = FALSE)
+  individual <- map2_dfr(
+    calibrations,
+    seq_along(calibrations),
+    tidy_calibration_curve
+  )
+  average <- tidy_calibration_curve(averaged, NA_integer_)
+
+  list(
+    per_imputation = calibrations,
+    averaged = averaged,
+    individual = individual,
+    average = average
+  )
+}
+
+plot_mi_bootstrap_calibration <- function(calibration, title, B) {
+  average_long <- calibration$average |>
+    select("predicted", "apparent", "optimism_corrected") |>
+    pivot_longer(
+      cols = c("apparent", "optimism_corrected"),
+      names_to = "curve",
+      values_to = "calibrated"
+    ) |>
+    mutate(curve = factor(
+      .data$curve,
+      levels = c("apparent", "optimism_corrected"),
+      labels = c("Apparent", "Optimism-corrected")
+    ))
+
+  upper_limit <- max(
+    calibration$individual$predicted,
+    calibration$individual$optimism_corrected,
+    calibration$average$predicted,
+    calibration$average$apparent,
+    calibration$average$optimism_corrected,
+    na.rm = TRUE
+  )
+  upper_limit <- min(1, max(0.4, 1.05 * upper_limit))
+
+  ggplot() +
+    geom_abline(slope = 1, intercept = 0, linetype = 2, color = "grey60") +
+    geom_line(
+      data = calibration$individual,
+      aes(
+        x = predicted,
+        y = optimism_corrected,
+        group = .data$.imp
+      ),
+      color = "#6f879e",
+      alpha = 0.3,
+      linewidth = 0.35
+    ) +
+    geom_line(
+      data = average_long,
+      aes(
+        x = predicted,
+        y = calibrated,
+        color = curve,
+        linetype = curve
+      ),
+      linewidth = 1
+    ) +
+    scale_color_manual(
+      values = c("Apparent" = "#333333", "Optimism-corrected" = "#b64a3b"),
+      name = NULL
+    ) +
+    scale_linetype_manual(
+      values = c("Apparent" = "dashed", "Optimism-corrected" = "solid"),
+      name = NULL
+    ) +
+    coord_equal(xlim = c(0, upper_limit), ylim = c(0, upper_limit)) +
+    labs(
+      title = title,
+      subtitle = paste0(
+        length(calibration$per_imputation),
+        " imputed datasets; ", B,
+        " patient-level bootstrap resamples per imputation"
+      ),
+      x = "Predicted probability",
+      y = "Estimated observed probability"
+    ) +
+    theme_minimal(base_size = 12) +
+    theme(
+      legend.position = "bottom",
+      panel.grid.minor = element_blank(),
+      plot.title = element_text(face = "bold"),
+      plot.background = element_rect(fill = "white", color = NA)
+    )
+}
+
+# ── tinytable wrapper ──────────────────────────────────────────────────────
+# Renders a data frame as a tinytable, dropping display-redundant columns
+# (contrast_label, reference_level, comparison_level) and applying the
+# "resize" theme so wide tables shrink to fit the Typst page width.
+
+tt_doc <- function(data, caption = NULL, digits = NULL) {
+  data |>
+    select(-any_of(c("contrast_label", "reference_level", "comparison_level"))) |>
+    tt(caption = caption, digits = digits)
+}
+
+# ── Simulation-based contrasts (probability scale) ───────────────────────────
+# Uses MVN draws from the joint distribution of all coefficients
+# (intercept + slopes) ~ MVN(coef(fit), fit$var). For each draw,
+# Pr(Y = 1 | X) is recomputed for both arms via plogis() and differenced.
+
+make_ref_newdata <- function(fit, settings = list()) {
+  dd_obj <- eval(as.name(getOption("datadist")))
+  adj <- dd_obj$limits["Adjust to", ]
+  vals <- dd_obj$values
+  d <- list()
+  for (nm in names(adj)) {
+    val <- if (nm %in% names(settings)) settings[[nm]] else adj[[nm]]
+    if (!is.null(vals[[nm]]) && is.character(vals[[nm]])) {
+      d[[nm]] <- factor(val, levels = vals[[nm]])
+    } else {
+      d[[nm]] <- as.numeric(val)
+    }
+  }
+  as.data.frame(d, stringsAsFactors = FALSE)
+}
+
+sim_contrast_prob <- function(fit, settings_a, settings_b,
+                              n_sim = 10000, conf_level = 0.95, seed = 0322026) {
+  set.seed(seed)
+  beta_hat <- coef(fit)
+  V <- fit$var
+
+  nd_a <- make_ref_newdata(fit, settings_a)
+  nd_b <- make_ref_newdata(fit, settings_b)
+  Xa <- predict(fit, nd_a, type = "x")
+  Xb <- predict(fit, nd_b, type = "x")
+
+  slope_idx <- 2:length(beta_hat)
+
+  # Plug-in point estimate from the pooled MLE
+  prob_a_hat <- plogis(beta_hat[1] + sum(Xa * beta_hat[slope_idx]))
+  prob_b_hat <- plogis(beta_hat[1] + sum(Xb * beta_hat[slope_idx]))
+  estimate_hat <- prob_a_hat - prob_b_hat
+
+  # Simulation for SE and CI
+  beta_sim <- MASS::mvrnorm(n_sim, beta_hat, V)
+  diffs <- numeric(n_sim)
+
+  for (i in seq_len(n_sim)) {
+    int_i    <- beta_sim[i, 1]
+    slopes_i <- beta_sim[i, slope_idx]
+    diffs[i] <- plogis(int_i + sum(Xa * slopes_i)) -
+                plogis(int_i + sum(Xb * slopes_i))
+  }
+
+  alpha <- 1 - conf_level
+  se <- sd(diffs)
+
+  tibble(
+    estimate  = estimate_hat,
+    std.error = se,
+    statistic = estimate_hat / se,
+    p.value   = 2 * pnorm(-abs(estimate_hat / se)),
+    conf.low  = quantile(diffs, alpha / 2, names = FALSE),
+    conf.high = quantile(diffs, 1 - alpha / 2, names = FALSE)
+  )
+}
+```
+
+## Data and Model Specification
+
+```{r}
+#| label: data-and-model-spec
+questionnaire_template <- make_questionnaire_template()
+mids_missingness <- readRDS(here("output", "03_imputation", "mids_missingness.rds"))
+
+# Build the reference (first-imputation) questionnaire-level dataset.
+# This is used for datadist, counterfactual grids, and level definitions.
+reference_questionnaires <- join_patient_covariates(
+  mice::complete(mids_missingness, 1),
+  questionnaire_template
+)
+```
+
+The model formula was agreed upon by expert consensus to include demographic and clinical predictors with a nonlinear spline term for age ($k = 3$ knots).
+
+```{r}
+#| label: model-spec
+#| echo: true
+full_formula <- any_missing_nonstructural ~
+  rcs(age, 3) + sex + language + marital_status + ecog_baseline + form_type
+
+validation_B <- 100L
+validation_seed <- 11082026L
+```
+
+{{<pagebreak>}}
+
+## Predictor Screening
+
+We check for collinearity among the candidate predictors using `varclus()`, which clusters variables by their Hoeffding $D$ or Spearman $\rho^2$ similarity.
+
+```{r}
+#| label: fig-predictor-screening
+#| echo: true
+#| fig-width: 7
+#| fig-height: 5
+predictor_clustering <- varclus(
+  ~ age + sex + language + marital_status + ecog_baseline + form_type,
+  data = reference_questionnaires
+)
+
+plot(predictor_clustering)
+```
+
+```{r}
+save_base_plot_dual(
+  function() {
+    plot(predictor_clustering)
+  },
+  here("output", "03_missingness_models_binary", "figures", "po_predictor_clustering"),
+  width = 7,
+  height = 5
+)
+```
+
+No pair of predictors clusters above $\rho^2 \approx 0.5$, so we proceed with all candidate terms.
+
+{{<pagebreak>}}
+
+## Outcome Support
+
+We tabulate the observed distribution of the binary response variable. The event is any non-structural missingness (`prop_missing_nonstructural > 0`), and the non-event is a fully complete questionnaire.
+
+```{r}
+#| label: fig-outcome-support
+#| fig-width: 8
+#| fig-height: 6
+outcome_support <- reference_questionnaires |>
+  mutate(
+    missingness_status = factor(
+      if_else(.data$any_missing_nonstructural == 1, "Any missing", "Complete"),
+      levels = c("Complete", "Any missing")
+    )
+  ) |>
+  count(missingness_status, sort = FALSE, name = "n_questionnaires") |>
+  mutate(share = .data$n_questionnaires / sum(.data$n_questionnaires))
+
+support_summary <- tibble(
+  n_questionnaires = nrow(reference_questionnaires),
+  n_patients = n_distinct(reference_questionnaires$pat_id),
+  event_rate_any_missing = mean(reference_questionnaires$any_missing_nonstructural == 1),
+  complete_rate = mean(reference_questionnaires$any_missing_nonstructural == 0)
+)
+
+support_plot <- outcome_support |>
+  ggplot(aes(x = missingness_status, y = n_questionnaires)) +
+  geom_col(fill = "black") +
+  labs(
+    title = "Observed support of questionnaire-level binary missingness",
+    x = "Outcome category",
+    y = "Questionnaires"
+  )
+
+support_plot
+
+write_parquet(outcome_support, here("output", "03_missingness_models_binary", "po_outcome_support.parquet"))
+save_plot_dual(support_plot, here("output", "03_missingness_models_binary", "figures", "po_outcome_support"))
+```
+
+{{<pagebreak>}}
+
+## Link Function
+
+All pooled MI models in this document use `rms::lrm()`, so predicted values and contrasts are directly on the logistic probability scale via `plogis`.
+
+{{<pagebreak>}}
+
+## Description of fitted model
+
+The prespecified full model is fitted in two passes. The primary fit (`lrt = FALSE`) uses `fun =` to run `validate()` and `calibrate()` without variable selection inside each imputation loop. Both procedures resample patients with replacement and retain all questionnaires belonging to each sampled patient. Scalar validation indices and calibration curves are then averaged across imputations using `processMI()`. A second fit with `lrt = TRUE` provides pooled likelihood-ratio ANOVA.
+
+```{r}
+#| label: full-model-results
+#| warnings: false
+#| output: false
+
+# Validate and calibrate the prespecified full model without backward
+# selection. The questionnaire template fixes row order, so this cluster
+# vector is aligned with the x and y matrices stored in every imputation fit.
+validation_patient_ids <- questionnaire_template$pat_id
+validation_fun <- make_validation_fun(
+  patient_ids = validation_patient_ids,
+  B = validation_B
+)
+
+set.seed(validation_seed)
+full_model <- fit_lrm_mi(
+  formula = full_formula,
+  lrt = FALSE,
+  questionnaire_template = questionnaire_template,
+  mids_obj = mids_missingness,
+  fun = validation_fun
+)
+# full_model
+
+full_model_lrt <- fit_lrm_mi(
+  formula = full_formula,
+  lrt = TRUE,
+  questionnaire_template = questionnaire_template,
+  mids_obj = mids_missingness
+)
+
+validation_successful_repetitions <- vapply(
+  full_model$funresults,
+  function(result) as.integer(result$validate["Dxy", "n"]),
+  integer(1)
+)
+attr(full_model, "validation_B") <- validation_B
+attr(full_model, "validation_successful_repetitions") <-
+  validation_successful_repetitions
+attr(full_model, "validation_n_questionnaires") <-
+  length(validation_patient_ids)
+attr(full_model, "validation_n_patients") <-
+  n_distinct(validation_patient_ids)
+
+saveRDS(full_model, here("output", "03_missingness_models_binary", "po_full_model_mi.rds"))
+saveRDS(full_model_lrt, here("output", "03_missingness_models_binary", "po_full_model_mi_lrt.rds"))
+```
+
+We rank apparent predictor importance using pooled likelihood-ratio (LR) chunk tests. For each predictor, `processMI(..., which = "anova")` pools the LR comparison between the full model and a model omitting all parameters belonging to that predictor, including spline parameters for age and indicator parameters for multi-level categorical variables. The dot chart visualizes the default `rms` ANOVA plotting statistic: the chunk $\chi^2$ statistic minus its degrees of freedom ($\chi^2 - \text{df}$). Subtracting degrees of freedom penalizes variables represented by more parameters. The plot reflects apparent contribution to model fit, not a causal effect, and does not show uncertainty in predictor importance.
+
+```{r}
+#| label: fig-full-model-importance
+full_anova <- processMI(full_model_lrt, which = "anova")
+full_anova_table <- as.data.frame(full_anova) |>
+  tibble::rownames_to_column("term")
+saveRDS(full_anova, here("output", "03_missingness_models_binary", "po_full_model_anova.rds"))
+write_parquet(full_anova_table, here("output", "03_missingness_models_binary", "po_full_model_anova.parquet"))
+full_anova
+plot(full_anova)
+
+save_base_plot_dual(
+  function() {
+    plot(full_anova)
+  },
+  here("output", "03_missingness_models_binary", "figures", "po_full_model_importance"),
+  width = 6,
+  height = 4
+)
+```
+
+Interquartile-range odds ratios for continuous predictors and simple odds ratios for categorical predictors. Numbers at left are upper quartile : lower quartile or current group : reference group. The bars represent confidence limits.
+
+```{r}
+#| label: fig-full-model-odds-ratios
+full_summary <- summary(full_model)
+full_summary
+par(mar = c(5, 16, 2, 2))
+plot(full_summary, log = TRUE)
+
+save_base_plot_dual(
+  function() {
+    par(mar = c(5, 16, 2, 2))
+    plot(full_summary, log = TRUE)
+  },
+  here("output", "03_missingness_models_binary", "figures", "po_full_model_odds_ratios"),
+  width = 10,
+  height = 8,
+  pointsize = 10
+)
+```
+
+The partial-effect plots show how the model linear predictor changes when one predictor is varied while the other variables are held at the reference values used by `rms::Predict()` from the `datadist` object. They should be read as descriptive association summaries on the model scale; the probability-scale ceteris paribus contrasts below are easier to interpret quantitatively.
+
+```{r}
+#| label: fig-full-model-partial-effects
+#| fig-width: 8
+#| fig-height: 8
+partial_effects_grob <- ggplot(
+  Predict(full_model),
+  sepdiscrete = "vertical",
+  vnames = "names",
+  abbrev = TRUE,
+  ylab = NULL
+)
+
+draw_partial_effects <- function() {
+  grid::grid.newpage()
+  grid::grid.draw(partial_effects_grob)
+}
+
+draw_partial_effects()
+
+save_base_plot_dual(
+  draw_partial_effects,
+  here("output", "03_missingness_models_binary", "figures", "po_full_model_partial_effects"),
+  width = 8.5,
+  height = 7,
+  pointsize = 10
+)
+```
+
+{{<pagebreak>}}
+
+## Internal Validation
+
+```{r}
+#| label: mi-validation
+mi_validation <- processMI(full_model, "validate")
+mi_validation_table <- as.data.frame.matrix(mi_validation) |>
+  tibble::rownames_to_column("metric")
+saveRDS(mi_validation, here("output", "03_missingness_models_binary", "po_model_validation.rds"))
+write_parquet(mi_validation_table, here("output", "03_missingness_models_binary", "po_model_validation.parquet"))
+print(mi_validation, B = validation_B, digits = 3)
+```
+
+Interpretation:
+
+-   (Pseudo) $R^2$: Nagelkerke's pseudo-$R^2$ summarizes the proportion of binary-outcome variation captured by the model on a likelihood-ratio scale. Low optimism-corrected values indicate limited overall predictive information.
+
+-   $D_{xy}$ (Somers' rank correlation): $D_{xy}$ is the proportion of concordant pairs minus the proportion of discordant pairs. A value of 0 means the model is no better than random at ranking questionnaires by missingness; a value of 1 means perfect ranking. The corresponding C-statistic is $(D_{xy} + 1) / 2$.
+
+-   Slope: the calibration slope summarizes overfitting. Values below 1 indicate that predictions are too extreme after optimism correction.
+
+-   g-index: this measures dispersion of the linear predictors. Larger values indicate stronger separation in predicted risk across questionnaires.
+
+-   pdm: this measures how far the model's average prediction is from 0.5. Values near 0 indicate predictions close to 0.5 for most observations.
+
+To sum up, our model has limited predictive performance. This is expected given the complexity of the missingness process and the limited set of routinely available predictors.
+
+{{<pagebreak>}}
+
+## Model-Based Summaries
+
+Predictions and contrasts use `rms::Predict()` and `rms::contrast()` natively. `Predict()` conditions on `datadist` medians/modes for covariates not being varied, which is the same strategy we used previously. Confidence intervals are Wald-based, using the pooled variance from Rubin's rules stored in the `fit.mult.impute` object.
+
+```{r}
+#| label: fig-predictions-age
+#| fig-width: 8
+#| fig-height: 6
+
+age_predictions <- Predict(full_model, age = seq(20, 100, by = 1), fun = plogis)
+
+age_plot <- ggplot(age_predictions) +
+  labs(
+    title = "Predicted Pr(any missing) by age",
+    y = "Predicted probability"
+  )
+
+write_parquet(as_tibble(age_predictions), here("output", "03_missingness_models_binary", "po_predictions_age.parquet"))
+save_plot_dual(age_plot, here("output", "03_missingness_models_binary", "figures", "po_predictions_age"))
+age_plot
+```
+
+```{r}
+#| label: fig-predictions-sex
+#| fig-width: 8
+#| fig-height: 6
+sex_predictions <- Predict(full_model, sex, fun = plogis)
+
+sex_plot <- ggplot(sex_predictions) +
+  labs(
+    title = "Predicted Pr(any missing) by sex",
+    y = "Predicted probability"
+  )
+
+write_parquet(as_tibble(sex_predictions), here("output", "03_missingness_models_binary", "po_predictions_sex.parquet"))
+save_plot_dual(sex_plot, here("output", "03_missingness_models_binary", "figures", "po_predictions_sex"))
+sex_plot
+```
+
+```{r}
+#| label: fig-predictions-language
+#| fig-width: 8
+#| fig-height: 6
+language_predictions <- Predict(full_model, language, fun = plogis)
+
+language_plot <- ggplot(language_predictions) +
+  labs(
+    title = "Predicted Pr(any missing) by language",
+    y = "Predicted probability"
+  )
+
+write_parquet(as_tibble(language_predictions), here("output", "03_missingness_models_binary", "po_predictions_language.parquet"))
+save_plot_dual(language_plot, here("output", "03_missingness_models_binary", "figures", "po_predictions_language"))
+language_plot
+```
+
+```{r}
+#| label: fig-predictions-marital-status
+#| fig-width: 8
+#| fig-height: 6
+marital_status_predictions <- Predict(full_model, marital_status, fun = plogis)
+
+marital_status_plot <- ggplot(marital_status_predictions) +
+  labs(
+    title = "Predicted Pr(any missing) by marital status",
+    y = "Predicted probability"
+  )
+
+write_parquet(as_tibble(marital_status_predictions), here("output", "03_missingness_models_binary", "po_predictions_marital_status.parquet"))
+save_plot_dual(marital_status_plot, here("output", "03_missingness_models_binary", "figures", "po_predictions_marital_status"))
+marital_status_plot
+```
+
+```{r}
+#| label: fig-predictions-ecog
+#| fig-width: 8
+#| fig-height: 6
+ecog_predictions <- Predict(full_model, ecog_baseline, fun = plogis)
+
+ecog_plot <- ggplot(ecog_predictions) +
+  labs(
+    title = "Predicted Pr(any missing) by ECOG",
+    y = "Predicted probability"
+  )
+
+write_parquet(as_tibble(ecog_predictions), here("output", "03_missingness_models_binary", "po_predictions_ecog.parquet"))
+save_plot_dual(ecog_plot, here("output", "03_missingness_models_binary", "figures", "po_predictions_ecog"))
+ecog_plot
+```
+
+```{r}
+#| label: fig-predictions-form-type
+#| fig-width: 8
+#| fig-height: 6
+form_type_predictions <- Predict(full_model, form_type, fun = plogis)
+
+form_type_plot <- ggplot(form_type_predictions) +
+  labs(
+    title = "Predicted Pr(any missing) by questionnaire form",
+    y = "Predicted probability"
+  )
+
+write_parquet(as_tibble(form_type_predictions), here("output", "03_missingness_models_binary", "po_predictions_form_type.parquet"))
+save_plot_dual(form_type_plot, here("output", "03_missingness_models_binary", "figures", "po_predictions_form_type"))
+form_type_plot
+```
+
+### Contrasts
+
+These contrasts quantify the change in predicted probability of any missingness when a focal predictor is shifted, holding all other covariates at their `datadist` reference values. Inference uses simulation from the multivariate normal distribution of the pooled coefficient estimates: 10 000 draws from $\text{MVN}(\hat\beta, \hat V)$ where $\hat V$ = `fit$var` (the Rubin-rules pooled variance). The point estimate is the plug-in value computed directly from $\hat\beta$; the standard error and interval are derived from the simulation draws.
+
+```{r}
+#| label: contrasts
+# Age 80 vs 50
+age_comparison <- sim_contrast_prob(full_model, list(age = 80), list(age = 50)) |>
+  mutate(term = "age", contrast = "Age 80 vs 50 years", .before = 1)
+write_parquet(age_comparison, here("output", "03_missingness_models_binary", "po_comparisons_age.parquet"))
+tt_doc(age_comparison, digits = 3, caption = "Conditional probability-difference contrast for age 80 versus 50 years.")
+
+# Sex
+sex_comparison <- sim_contrast_prob(full_model, list(sex = "female"), list(sex = "male")) |>
+  mutate(term = "sex", contrast = "Female vs male", .before = 1)
+write_parquet(sex_comparison, here("output", "03_missingness_models_binary", "po_comparisons_sex.parquet"))
+tt_doc(sex_comparison, digits = 3, caption = "Conditional probability-difference contrast for female versus male sex.")
+
+# Language contrasts vs modal level
+language_reference <- as.character(
+  dd_missingness_models$limits$language[2]  # adjust.to (mode)
+)
+language_comparisons <- bind_rows(lapply(
+  setdiff(levels(reference_questionnaires$language), language_reference),
+  function(lv) {
+    sim_contrast_prob(full_model, list(language = lv), list(language = language_reference)) |>
+      mutate(term = "language", contrast = paste(lv, "vs", language_reference), .before = 1)
+  }
+))
+write_parquet(language_comparisons, here("output", "03_missingness_models_binary", "po_comparisons_language.parquet"))
+tt_doc(language_comparisons, digits = 3, caption = "Conditional probability-difference contrasts for language versus the modal language.")
+
+# Marital status contrasts vs modal level
+marital_status_reference <- as.character(
+  dd_missingness_models$limits$marital_status[2]  # adjust.to (mode)
+)
+marital_status_comparisons <- bind_rows(lapply(
+  setdiff(levels(reference_questionnaires$marital_status), marital_status_reference),
+  function(lv) {
+    sim_contrast_prob(full_model, list(marital_status = lv), list(marital_status = marital_status_reference)) |>
+      mutate(term = "marital_status", contrast = paste(lv, "vs", marital_status_reference), .before = 1)
+  }
+))
+write_parquet(marital_status_comparisons, here("output", "03_missingness_models_binary", "po_comparisons_marital_status.parquet"))
+tt_doc(marital_status_comparisons, digits = 3, caption = "Conditional probability-difference contrasts for marital status versus the modal marital status.")
+
+# ECOG contrasts vs ECOG 0
+ecog_comparisons <- bind_rows(lapply(
+  levels(reference_questionnaires$ecog_baseline)[-1],
+  function(lv) {
+    sim_contrast_prob(full_model, list(ecog_baseline = lv), list(ecog_baseline = "0")) |>
+      mutate(term = "ecog_baseline", contrast = paste("ECOG", lv, "vs ECOG 0"), .before = 1)
+  }
+))
+write_parquet(ecog_comparisons, here("output", "03_missingness_models_binary", "po_comparisons_ecog.parquet"))
+tt_doc(ecog_comparisons, digits = 3, caption = "Conditional probability-difference contrasts for ECOG level versus ECOG 0.")
+
+# Form type
+form_type_comparison <- sim_contrast_prob(
+  full_model, list(form_type = "short_version"), list(form_type = "long_version")
+) |>
+  mutate(term = "form_type", contrast = "Short vs long questionnaire", .before = 1)
+write_parquet(form_type_comparison, here("output", "03_missingness_models_binary", "po_comparisons_form_type.parquet"))
+tt_doc(form_type_comparison, digits = 3, caption = "Conditional probability-difference contrast for short versus long questionnaire form.")
+```
+
+```{r}
+#| label: profile-contrast
+# Cross-contrast: (age=80, ecog=3+) vs (age=50, ecog=0)
+profile_comparisons <- sim_contrast_prob(
+  full_model,
+  list(age = 80, ecog_baseline = "3+"),
+  list(age = 50, ecog_baseline = "0")
+) |>
+  mutate(
+    term = "age x ecog_baseline",
+    contrast = "80-year-old with ECOG 3+ vs fit 50-year-old with ECOG 0",
+    .before = 1
+  )
+write_parquet(profile_comparisons, here("output", "03_missingness_models_binary", "po_comparisons_profiles.parquet"))
+tt_doc(profile_comparisons, digits = 3, caption = "Conditional probability-difference contrast comparing an 80-year-old patient with ECOG 3+ to a fit 50-year-old patient with ECOG 0, holding remaining covariates at their mean or modal values.")
+```
+
+{{<pagebreak>}}
+
+## Predicted Event Probabilities
+
+For the binary outcome, the key estimand is the model-based event probability $\Pr(\text{any missing} = 1 \mid X)$. We summarize this probability on `Predict()` grids while holding non-focal covariates at their `datadist` reference values. Confidence intervals are computed by simulation from the multivariate normal distribution of the pooled coefficient vector using the pooled covariance from the `fit.mult.impute` object, then transforming simulated linear predictors to probabilities.
+
+```{r}
+#| label: event-probability-grids
+# Build event-probability grids from Predict() output.
+# Predict() returns data frames with the focal variable varied and all others
+# at datadist medians/modes -- exactly what predict_event_probabilities needs.
+age_exc_grid <- as.data.frame(Predict(full_model, age = seq(20, 100, by = 1)))
+sex_exc_grid <- as.data.frame(Predict(full_model, sex))
+ecog_exc_grid <- as.data.frame(Predict(full_model, ecog_baseline))
+
+age_prediction_reference <- format_prediction_reference(full_model, exclude = "age")
+ecog_prediction_reference <- format_prediction_reference(full_model, exclude = "ecog_baseline")
+```
+
+```{r}
+#| label: fig-exceedance-age
+#| fig-width: 8
+#| fig-height: 6
+age_exceedance <- predict_event_probabilities(
+  full_model,
+  newdata = age_exc_grid,
+  by = "age"
+)
+
+age_exceedance_plot <- age_exceedance |>
+  ggplot(aes(x = age, y = estimate)) +
+  geom_ribbon(
+    aes(ymin = conf.low, ymax = conf.high),
+    fill = "#2C7FB8",
+    alpha = 0.18
+  ) +
+  geom_line(linewidth = 1, color = "#176B87") +
+  scale_y_continuous(labels = label_percent(accuracy = 1)) +
+  labs(
+    title = "Age",
+    subtitle = str_wrap(age_prediction_reference, width = 48),
+    x = "Age",
+    y = "Predicted probability"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    panel.grid.minor = element_blank(),
+    plot.title = element_text(face = "bold"),
+    plot.subtitle = element_text(size = 8.5, lineheight = 0.95),
+    plot.background = element_rect(fill = "white", color = NA)
+  )
+
+write_parquet(age_exceedance, here("output", "03_missingness_models_binary", "po_exceedance_age.parquet"))
+save_plot_dual(age_exceedance_plot, here("output", "03_missingness_models_binary", "figures", "po_exceedance_age"))
+age_exceedance_plot
+```
+
+```{r}
+#| label: fig-exceedance-ecog
+#| fig-width: 8
+#| fig-height: 6
+ecog_exceedance <- predict_event_probabilities(
+  full_model,
+  newdata = ecog_exc_grid,
+  by = "ecog_baseline"
+)
+
+ecog_exceedance_plot <- ecog_exceedance |>
+  ggplot(aes(x = ecog_baseline, y = estimate, group = 1)) +
+  geom_errorbar(
+    aes(ymin = conf.low, ymax = conf.high),
+    width = 0.12,
+    color = "#176B87"
+  ) +
+  geom_point(size = 2.6, color = "#176B87") +
+  scale_y_continuous(labels = label_percent(accuracy = 1)) +
+  labs(
+    title = "Baseline ECOG performance status",
+    subtitle = str_wrap(ecog_prediction_reference, width = 48),
+    x = "ECOG baseline",
+    y = "Predicted probability"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    panel.grid.minor = element_blank(),
+    plot.title = element_text(face = "bold"),
+    plot.subtitle = element_text(size = 8.5, lineheight = 0.95),
+    plot.background = element_rect(fill = "white", color = NA)
+  )
+
+write_parquet(ecog_exceedance, here("output", "03_missingness_models_binary", "po_exceedance_ecog.parquet"))
+save_plot_dual(ecog_exceedance_plot, here("output", "03_missingness_models_binary", "figures", "po_exceedance_ecog"))
+ecog_exceedance_plot
+```
+
+```{r}
+#| label: fig-exceedance-age-ecog
+#| fig-width: 10
+#| fig-height: 4.8
+age_ecog_exceedance_plot <- age_exceedance_plot +
+  ecog_exceedance_plot +
+  plot_layout(ncol = 2, widths = c(1.15, 1)) +
+  plot_annotation(tag_levels = "A", tag_suffix = ")") &
+  theme(plot.title = element_text(size = 11))
+
+save_plot_dual(
+  age_ecog_exceedance_plot,
+  here("output", "03_missingness_models_binary", "figures", "po_exceedance_age_ecog"),
+  width = 10,
+  height = 4.8
+)
+age_ecog_exceedance_plot
+```
+
+{{<pagebreak>}}
+
+## MI-Integrated Bootstrap Calibration
+
+Calibration plots compare predicted $\Pr(\text{any missing} = 1 \mid X)$ against estimated observed event rates. Within each of the 10 completed datasets, `rms::calibrate()` uses LOWESS and 100 patient-level bootstrap resamples to estimate and correct overfitting optimism. `processMI()` then interpolates the curves to a common predicted-probability grid and averages the apparent and optimism-corrected estimates across imputations. Calibration is evaluated for questionnaires, while resampling respects the patient as the independent sampling unit.
+
+```{r}
+#| label: calibration-data
+calibration_full <- build_mi_bootstrap_calibration(full_model)
+
+saveRDS(
+  list(calibration_full = calibration_full),
+  here("output", "03_missingness_models_binary", "po_mi_calibration.rds")
+)
+write_parquet(
+  bind_rows(
+    calibration_full$individual |>
+      mutate(summary = "per_imputation", .before = 1),
+    calibration_full$average |>
+      mutate(summary = "mi_average", .before = 1)
+  ),
+  here("output", "03_missingness_models_binary", "po_mi_calibration.parquet")
+)
+```
+
+```{r}
+#| label: fig-calibration-full-plot
+#| fig-cap: "Calibration averaged across 10 multiply imputed datasets, with 100 patient-level bootstrap resamples per imputation. Thin lines show optimism-corrected curves for individual imputations; the dashed and solid lines show the MI-average apparent and optimism-corrected calibration, respectively."
+#| fig-alt: "Calibration plot with an ideal diagonal, ten faint patient-bootstrap-corrected curves from the imputed datasets, a dashed average apparent curve, and a solid average optimism-corrected curve."
+#| fig-width: 6
+#| fig-height: 6
+calibration_full_plot <- plot_mi_bootstrap_calibration(
+  calibration_full,
+  title = "Bootstrap-corrected calibration of the full model",
+  B = validation_B
+)
+
+save_plot_dual(calibration_full_plot, here("output", "03_missingness_models_binary", "figures", "po_calibration_full_mi"))
+calibration_full_plot
+```
+
+The full model uses `rms::lrm()` with a nonlinear spline term for age ($k = 3$ knots) and is validated without data-driven variable selection. The apparent calibration curve is shown only as a comparator; the MI-averaged patient-bootstrap-corrected curve is the primary graphical calibration estimate.

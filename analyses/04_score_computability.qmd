@@ -1,0 +1,704 @@
+---
+title: "EORTC Score Availability"
+author: "Johannes Schwenke"
+date: today
+format:
+  typst: default
+bibliography: ../references.bib
+---
+
+## Overview
+
+This document calculates how many EORTC scores can be calculated from each recorded questionnaire during the first six months after first contact.
+
+```{r}
+#| label: setup
+library(here)
+library(arrow)
+library(tidyverse)
+library(scales)
+library(tinytable)
+
+source(here("R", "io.R"))
+
+output_dir <- here("output", "04_score_computability")
+followup_limit_days <- 182L
+
+ensure_dir(output_dir)
+```
+
+## Analysis Data
+
+Questionnaires recorded from day 0 through day 182 are included. Questionnaires with all items missing remain in the analysis and yield no calculated scores.
+
+```{r}
+#| label: load-data
+questionnaires <- read_parquet(
+  here("output", "derived", "questionnaires.parquet")
+) |>
+  filter(
+    !is.na(days_since_first_contact),
+    days_since_first_contact >= 0,
+    days_since_first_contact <= followup_limit_days
+  ) |>
+  mutate(
+    assessment = if_else(
+      days_since_first_contact == 0,
+      "First contact",
+      "Follow-up"
+    ),
+    assessment = factor(
+      assessment,
+      levels = c("First contact", "Follow-up")
+    ),
+    scoring_rule = if_else(
+      assessment == "First contact",
+      "QLQ-C30",
+      "QLQ-C15-PAL"
+    ),
+    administered_form = case_when(
+      form_type == "long_version" ~ "EORTC QLQ-C30",
+      form_type == "short_version" ~
+        "Adapted EORTC QLQ-C15-based follow-up form"
+    )
+  )
+
+questionnaire_items <- read_parquet(
+  here("output", "derived", "questionnaire_items_long.parquet")
+) |>
+  filter(questionnaire_key %in% questionnaires$questionnaire_key) |>
+  filter(str_detect(item_code, "^q([1-9]|[12][0-9]|30)$")) |>
+  mutate(
+    response = case_when(
+      item_code %in% c("q29", "q30") & response %in% 1:7 ~ response,
+      !(item_code %in% c("q29", "q30")) & response %in% 1:4 ~ response,
+      TRUE ~ NA_real_
+    )
+  ) |>
+  select(questionnaire_key, item_code, response)
+
+questionnaire_items_wide <- questionnaire_items |>
+  pivot_wider(
+    names_from = item_code,
+    values_from = response
+  )
+
+score_data <- questionnaires |>
+  left_join(questionnaire_items_wide, by = "questionnaire_key")
+```
+
+## Item and Score Crosswalk
+
+Stored item names always use QLQ-C30 numbering. The crosswalk records the corresponding QLQ-C15-PAL item numbers used for follow-up scoring.
+
+```{r}
+#| label: score-crosswalk
+c30_score_item_crosswalk <- tribble(
+  ~scoring_rule, ~score_code, ~score_label, ~score_type, ~c15_item_number, ~c30_item_code, ~n_items_total, ~n_items_required,
+  "QLQ-C30", "QL2", "Global health status / quality of life", "global", NA_integer_, "q29", 2L, 1L,
+  "QLQ-C30", "QL2", "Global health status / quality of life", "global", NA_integer_, "q30", 2L, 1L,
+  "QLQ-C30", "PF2", "Physical functioning", "function", NA_integer_, "q1", 5L, 3L,
+  "QLQ-C30", "PF2", "Physical functioning", "function", NA_integer_, "q2", 5L, 3L,
+  "QLQ-C30", "PF2", "Physical functioning", "function", NA_integer_, "q3", 5L, 3L,
+  "QLQ-C30", "PF2", "Physical functioning", "function", NA_integer_, "q4", 5L, 3L,
+  "QLQ-C30", "PF2", "Physical functioning", "function", NA_integer_, "q5", 5L, 3L,
+  "QLQ-C30", "RF2", "Role functioning", "function", NA_integer_, "q6", 2L, 1L,
+  "QLQ-C30", "RF2", "Role functioning", "function", NA_integer_, "q7", 2L, 1L,
+  "QLQ-C30", "EF", "Emotional functioning", "function", NA_integer_, "q21", 4L, 2L,
+  "QLQ-C30", "EF", "Emotional functioning", "function", NA_integer_, "q22", 4L, 2L,
+  "QLQ-C30", "EF", "Emotional functioning", "function", NA_integer_, "q23", 4L, 2L,
+  "QLQ-C30", "EF", "Emotional functioning", "function", NA_integer_, "q24", 4L, 2L,
+  "QLQ-C30", "CF", "Cognitive functioning", "function", NA_integer_, "q20", 2L, 1L,
+  "QLQ-C30", "CF", "Cognitive functioning", "function", NA_integer_, "q25", 2L, 1L,
+  "QLQ-C30", "SF", "Social functioning", "function", NA_integer_, "q26", 2L, 1L,
+  "QLQ-C30", "SF", "Social functioning", "function", NA_integer_, "q27", 2L, 1L,
+  "QLQ-C30", "FA", "Fatigue", "symptom", NA_integer_, "q10", 3L, 2L,
+  "QLQ-C30", "FA", "Fatigue", "symptom", NA_integer_, "q12", 3L, 2L,
+  "QLQ-C30", "FA", "Fatigue", "symptom", NA_integer_, "q18", 3L, 2L,
+  "QLQ-C30", "NV", "Nausea and vomiting", "symptom", NA_integer_, "q14", 2L, 1L,
+  "QLQ-C30", "NV", "Nausea and vomiting", "symptom", NA_integer_, "q15", 2L, 1L,
+  "QLQ-C30", "PA", "Pain", "symptom", NA_integer_, "q9", 2L, 1L,
+  "QLQ-C30", "PA", "Pain", "symptom", NA_integer_, "q19", 2L, 1L,
+  "QLQ-C30", "DY", "Dyspnoea", "symptom", NA_integer_, "q8", 1L, 1L,
+  "QLQ-C30", "SL", "Insomnia", "symptom", NA_integer_, "q11", 1L, 1L,
+  "QLQ-C30", "AP", "Appetite loss", "symptom", NA_integer_, "q13", 1L, 1L,
+  "QLQ-C30", "CO", "Constipation", "symptom", NA_integer_, "q16", 1L, 1L,
+  "QLQ-C30", "DI", "Diarrhoea", "symptom", NA_integer_, "q17", 1L, 1L,
+  "QLQ-C30", "FI", "Financial difficulties", "symptom", NA_integer_, "q28", 1L, 1L
+)
+
+c15_score_item_crosswalk <- tribble(
+  ~scoring_rule, ~score_code, ~score_label, ~score_type, ~c15_item_number, ~c30_item_code, ~n_items_total, ~n_items_required,
+  "QLQ-C15-PAL", "PF2", "Physical functioning", "function", 1L, "q3", 3L, 3L,
+  "QLQ-C15-PAL", "PF2", "Physical functioning", "function", 2L, "q4", 3L, 3L,
+  "QLQ-C15-PAL", "PF2", "Physical functioning", "function", 3L, "q5", 3L, 3L,
+  "QLQ-C15-PAL", "DY", "Dyspnoea", "symptom", 4L, "q8", 1L, 1L,
+  "QLQ-C15-PAL", "PA", "Pain", "symptom", 5L, "q9", 2L, 1L,
+  "QLQ-C15-PAL", "SL", "Insomnia", "symptom", 6L, "q11", 1L, 1L,
+  "QLQ-C15-PAL", "FA", "Fatigue", "symptom", 7L, "q12", 2L, 2L,
+  "QLQ-C15-PAL", "AP", "Appetite loss", "symptom", 8L, "q13", 1L, 1L,
+  "QLQ-C15-PAL", "NV", "Nausea and vomiting", "symptom", 9L, "q14", 1L, 1L,
+  "QLQ-C15-PAL", "CO", "Constipation", "symptom", 10L, "q16", 1L, 1L,
+  "QLQ-C15-PAL", "FA", "Fatigue", "symptom", 11L, "q18", 2L, 2L,
+  "QLQ-C15-PAL", "PA", "Pain", "symptom", 12L, "q19", 2L, 1L,
+  "QLQ-C15-PAL", "EF", "Emotional functioning", "function", 13L, "q21", 2L, 2L,
+  "QLQ-C15-PAL", "EF", "Emotional functioning", "function", 14L, "q24", 2L, 2L,
+  "QLQ-C15-PAL", "QL", "Quality of life", "global", 15L, "q30", 1L, 1L
+)
+
+score_item_crosswalk <- bind_rows(
+  c30_score_item_crosswalk,
+  c15_score_item_crosswalk
+)
+
+write_parquet(
+  score_item_crosswalk,
+  here(output_dir, "score_item_crosswalk.parquet")
+)
+
+score_rule_table <- score_item_crosswalk |>
+  arrange(scoring_rule, score_code, c15_item_number, c30_item_code) |>
+  summarise(
+    `Stored items` = paste(c30_item_code, collapse = ", "),
+    `C15-PAL items` = if_else(
+      all(is.na(c15_item_number)),
+      "-",
+      paste(c15_item_number, collapse = ", ")
+    ),
+    Required = first(n_items_required),
+    `Total items` = first(n_items_total),
+    .by = c(scoring_rule, score_code, score_label)
+  ) |>
+  rename(
+    `Scoring rules` = scoring_rule,
+    Score = score_code,
+    Measure = score_label
+  )
+
+tt(
+  score_rule_table,
+  caption = "EORTC score and item crosswalk. Stored item names use QLQ-C30 numbering."
+)
+```
+
+## Score Calculation
+
+### QLQ-C30 rules at first contact
+
+Multi-item scores are calculated when at least half of their items have responses. Missing components are omitted from the raw-score mean [@Fayers2001-eortc-scoring].
+
+```{r}
+#| label: calculate-c30-scores
+c30_scores <- score_data |>
+  filter(assessment == "First contact") |>
+  mutate(
+    c30_ql2_n = rowSums(!is.na(pick(q29, q30))),
+    c30_ql2_raw = rowMeans(pick(q29, q30), na.rm = TRUE),
+    c30_ql2 = if_else(
+      c30_ql2_n >= 1,
+      (c30_ql2_raw - 1) / 6 * 100,
+      NA_real_
+    ),
+    c30_pf2_n = rowSums(!is.na(pick(q1, q2, q3, q4, q5))),
+    c30_pf2_raw = rowMeans(pick(q1, q2, q3, q4, q5), na.rm = TRUE),
+    c30_pf2 = if_else(
+      c30_pf2_n >= 3,
+      (1 - (c30_pf2_raw - 1) / 3) * 100,
+      NA_real_
+    ),
+    c30_rf2_n = rowSums(!is.na(pick(q6, q7))),
+    c30_rf2_raw = rowMeans(pick(q6, q7), na.rm = TRUE),
+    c30_rf2 = if_else(
+      c30_rf2_n >= 1,
+      (1 - (c30_rf2_raw - 1) / 3) * 100,
+      NA_real_
+    ),
+    c30_ef_n = rowSums(!is.na(pick(q21, q22, q23, q24))),
+    c30_ef_raw = rowMeans(pick(q21, q22, q23, q24), na.rm = TRUE),
+    c30_ef = if_else(
+      c30_ef_n >= 2,
+      (1 - (c30_ef_raw - 1) / 3) * 100,
+      NA_real_
+    ),
+    c30_cf_n = rowSums(!is.na(pick(q20, q25))),
+    c30_cf_raw = rowMeans(pick(q20, q25), na.rm = TRUE),
+    c30_cf = if_else(
+      c30_cf_n >= 1,
+      (1 - (c30_cf_raw - 1) / 3) * 100,
+      NA_real_
+    ),
+    c30_sf_n = rowSums(!is.na(pick(q26, q27))),
+    c30_sf_raw = rowMeans(pick(q26, q27), na.rm = TRUE),
+    c30_sf = if_else(
+      c30_sf_n >= 1,
+      (1 - (c30_sf_raw - 1) / 3) * 100,
+      NA_real_
+    ),
+    c30_fa_n = rowSums(!is.na(pick(q10, q12, q18))),
+    c30_fa_raw = rowMeans(pick(q10, q12, q18), na.rm = TRUE),
+    c30_fa = if_else(
+      c30_fa_n >= 2,
+      (c30_fa_raw - 1) / 3 * 100,
+      NA_real_
+    ),
+    c30_nv_n = rowSums(!is.na(pick(q14, q15))),
+    c30_nv_raw = rowMeans(pick(q14, q15), na.rm = TRUE),
+    c30_nv = if_else(
+      c30_nv_n >= 1,
+      (c30_nv_raw - 1) / 3 * 100,
+      NA_real_
+    ),
+    c30_pa_n = rowSums(!is.na(pick(q9, q19))),
+    c30_pa_raw = rowMeans(pick(q9, q19), na.rm = TRUE),
+    c30_pa = if_else(
+      c30_pa_n >= 1,
+      (c30_pa_raw - 1) / 3 * 100,
+      NA_real_
+    ),
+    c30_dy = if_else(!is.na(q8), (q8 - 1) / 3 * 100, NA_real_),
+    c30_sl = if_else(!is.na(q11), (q11 - 1) / 3 * 100, NA_real_),
+    c30_ap = if_else(!is.na(q13), (q13 - 1) / 3 * 100, NA_real_),
+    c30_co = if_else(!is.na(q16), (q16 - 1) / 3 * 100, NA_real_),
+    c30_di = if_else(!is.na(q17), (q17 - 1) / 3 * 100, NA_real_),
+    c30_fi = if_else(!is.na(q28), (q28 - 1) / 3 * 100, NA_real_)
+  ) |>
+  select(
+    pat_id,
+    questionnaire_number,
+    questionnaire_key,
+    assessment,
+    scoring_rule,
+    administered_form,
+    form_type,
+    noquestionnaire,
+    days_since_first_contact,
+    app_day,
+    encounter_type,
+    c30_ql2,
+    c30_pf2,
+    c30_rf2,
+    c30_ef,
+    c30_cf,
+    c30_sf,
+    c30_fa,
+    c30_nv,
+    c30_pa,
+    c30_dy,
+    c30_sl,
+    c30_ap,
+    c30_co,
+    c30_di,
+    c30_fi
+  )
+```
+
+### QLQ-C15-PAL rules during follow-up
+
+The shortened PF2, EF, FA, and NV scores use the published QLQ-C15-PAL transformations and require every component item. Pain retains the QLQ-C30 missing-item rule, while each single-item score requires its item [@Groenvold2006-c15-scoring].
+
+```{r}
+#| label: calculate-c15-scores
+c15_scores <- score_data |>
+  filter(assessment == "Follow-up") |>
+  mutate(
+    c15_pf2_sum = 12 - (q3 + q4 + q5),
+    c15_pf2 = case_when(
+      is.na(c15_pf2_sum) ~ NA_real_,
+      c15_pf2_sum >= 0 & c15_pf2_sum <= 5 ~ c15_pf2_sum * 100 / 15,
+      c15_pf2_sum == 6 ~ 7 * 100 / 15,
+      c15_pf2_sum == 7 ~ 9 * 100 / 15,
+      c15_pf2_sum == 8 ~ 11 * 100 / 15,
+      c15_pf2_sum == 9 ~ 14 * 100 / 15,
+      TRUE ~ NA_real_
+    ),
+    c15_fa_sum = q12 + q18 - 2,
+    c15_fa = case_when(
+      is.na(c15_fa_sum) ~ NA_real_,
+      c15_fa_sum == 0 ~ 0,
+      c15_fa_sum == 1 ~ 2 * 100 / 9,
+      c15_fa_sum == 2 ~ 3 * 100 / 9,
+      (q12 == 3 & q18 == 2) | (q12 == 4 & q18 == 1) ~ 4 * 100 / 9,
+      (q12 == 1 & q18 == 4) | (q12 == 2 & q18 == 3) ~ 5 * 100 / 9,
+      c15_fa_sum == 4 ~ 6 * 100 / 9,
+      c15_fa_sum == 5 ~ 8 * 100 / 9,
+      c15_fa_sum == 6 ~ 100,
+      TRUE ~ NA_real_
+    ),
+    c15_nv = case_when(
+      q14 == 1 ~ 0,
+      q14 == 2 ~ 100 / 6,
+      q14 == 3 ~ 50,
+      q14 == 4 ~ 100,
+      TRUE ~ NA_real_
+    ),
+    c15_ef_sum = 8 - (q21 + q24),
+    c15_ef = case_when(
+      is.na(c15_ef_sum) ~ NA_real_,
+      c15_ef_sum == 0 ~ 0,
+      c15_ef_sum == 1 ~ 2 * 100 / 12,
+      c15_ef_sum == 2 ~ 5 * 100 / 12,
+      c15_ef_sum == 3 ~ 50,
+      c15_ef_sum == 4 ~ 8 * 100 / 12,
+      c15_ef_sum == 5 ~ 10 * 100 / 12,
+      c15_ef_sum == 6 ~ 100,
+      TRUE ~ NA_real_
+    ),
+    c15_pa_n = rowSums(!is.na(pick(q9, q19))),
+    c15_pa_raw = rowMeans(pick(q9, q19), na.rm = TRUE),
+    c15_pa = if_else(
+      c15_pa_n >= 1,
+      (c15_pa_raw - 1) / 3 * 100,
+      NA_real_
+    ),
+    c15_dy = if_else(!is.na(q8), (q8 - 1) / 3 * 100, NA_real_),
+    c15_sl = if_else(!is.na(q11), (q11 - 1) / 3 * 100, NA_real_),
+    c15_ap = if_else(!is.na(q13), (q13 - 1) / 3 * 100, NA_real_),
+    c15_co = if_else(!is.na(q16), (q16 - 1) / 3 * 100, NA_real_),
+    c15_ql = if_else(!is.na(q30), (q30 - 1) / 6 * 100, NA_real_)
+  ) |>
+  select(
+    pat_id,
+    questionnaire_number,
+    questionnaire_key,
+    assessment,
+    scoring_rule,
+    administered_form,
+    form_type,
+    noquestionnaire,
+    days_since_first_contact,
+    app_day,
+    encounter_type,
+    c15_pf2,
+    c15_ef,
+    c15_fa,
+    c15_nv,
+    c15_pa,
+    c15_dy,
+    c15_sl,
+    c15_ap,
+    c15_co,
+    c15_ql
+  )
+```
+
+## Score Availability
+
+```{r}
+#| label: derive-score-availability
+score_values_wide <- bind_rows(c30_scores, c15_scores)
+
+score_column_lookup <- tribble(
+  ~scoring_rule, ~score_column, ~score_code,
+  "QLQ-C30", "c30_ql2", "QL2",
+  "QLQ-C30", "c30_pf2", "PF2",
+  "QLQ-C30", "c30_rf2", "RF2",
+  "QLQ-C30", "c30_ef", "EF",
+  "QLQ-C30", "c30_cf", "CF",
+  "QLQ-C30", "c30_sf", "SF",
+  "QLQ-C30", "c30_fa", "FA",
+  "QLQ-C30", "c30_nv", "NV",
+  "QLQ-C30", "c30_pa", "PA",
+  "QLQ-C30", "c30_dy", "DY",
+  "QLQ-C30", "c30_sl", "SL",
+  "QLQ-C30", "c30_ap", "AP",
+  "QLQ-C30", "c30_co", "CO",
+  "QLQ-C30", "c30_di", "DI",
+  "QLQ-C30", "c30_fi", "FI",
+  "QLQ-C15-PAL", "c15_pf2", "PF2",
+  "QLQ-C15-PAL", "c15_ef", "EF",
+  "QLQ-C15-PAL", "c15_fa", "FA",
+  "QLQ-C15-PAL", "c15_nv", "NV",
+  "QLQ-C15-PAL", "c15_pa", "PA",
+  "QLQ-C15-PAL", "c15_dy", "DY",
+  "QLQ-C15-PAL", "c15_sl", "SL",
+  "QLQ-C15-PAL", "c15_ap", "AP",
+  "QLQ-C15-PAL", "c15_co", "CO",
+  "QLQ-C15-PAL", "c15_ql", "QL"
+)
+
+score_metadata <- score_item_crosswalk |>
+  distinct(
+    scoring_rule,
+    score_code,
+    score_label,
+    score_type,
+    n_items_total,
+    n_items_required
+  )
+
+score_answer_counts <- questionnaires |>
+  select(questionnaire_key, scoring_rule) |>
+  inner_join(
+    score_item_crosswalk,
+    by = "scoring_rule",
+    relationship = "many-to-many"
+  ) |>
+  left_join(
+    questionnaire_items,
+    by = c(
+      "questionnaire_key",
+      "c30_item_code" = "item_code"
+    )
+  ) |>
+  summarise(
+    n_items_answered = sum(!is.na(response)),
+    .by = c(
+      questionnaire_key,
+      scoring_rule,
+      score_code
+    )
+  )
+
+score_values_long <- score_values_wide |>
+  pivot_longer(
+    cols = matches("^(c30|c15)_"),
+    names_to = "score_column",
+    values_to = "score_value"
+  ) |>
+  inner_join(
+    score_column_lookup,
+    by = c("scoring_rule", "score_column")
+  ) |>
+  left_join(
+    score_metadata,
+    by = c("scoring_rule", "score_code")
+  ) |>
+  left_join(
+    score_answer_counts,
+    by = c("questionnaire_key", "scoring_rule", "score_code")
+  ) |>
+  mutate(computable = !is.na(score_value)) |>
+  select(
+    pat_id,
+    questionnaire_number,
+    questionnaire_key,
+    assessment,
+    scoring_rule,
+    administered_form,
+    form_type,
+    noquestionnaire,
+    days_since_first_contact,
+    app_day,
+    encounter_type,
+    score_code,
+    score_label,
+    score_type,
+    n_items_total,
+    n_items_required,
+    n_items_answered,
+    computable,
+    score_value
+  ) |>
+  arrange(pat_id, questionnaire_number, score_code)
+
+questionnaire_score_availability <- score_values_long |>
+  summarise(
+    n_scores_possible = n(),
+    n_scores_calculated = sum(computable),
+    prop_scores_calculated = mean(computable),
+    all_scores_calculated = all(computable),
+    some_scores_calculated = any(computable) & !all(computable),
+    no_scores_calculated = !any(computable),
+    .by = c(
+      pat_id,
+      questionnaire_number,
+      questionnaire_key,
+      assessment,
+      scoring_rule,
+      administered_form,
+      form_type,
+      noquestionnaire,
+      days_since_first_contact,
+      app_day,
+      encounter_type
+    )
+  ) |>
+  arrange(pat_id, questionnaire_number)
+
+score_availability_summary <- questionnaire_score_availability |>
+  summarise(
+    n_questionnaires = n(),
+    n_scores_possible = first(n_scores_possible),
+    mean_scores_calculated = mean(n_scores_calculated),
+    sd_scores_calculated = sd(n_scores_calculated),
+    mean_prop_scores_calculated = mean(prop_scores_calculated),
+    n_all_scores_calculated = sum(all_scores_calculated),
+    prop_all_scores_calculated = mean(all_scores_calculated),
+    n_no_scores_calculated = sum(no_scores_calculated),
+    prop_no_scores_calculated = mean(no_scores_calculated),
+    .by = assessment
+  ) |>
+  arrange(assessment)
+
+score_availability_by_measure <- score_values_long |>
+  summarise(
+    n_questionnaires = n(),
+    n_scores_calculated = sum(computable),
+    prop_scores_calculated = mean(computable),
+    .by = c(
+      assessment,
+      scoring_rule,
+      score_code,
+      score_label
+    )
+  ) |>
+  arrange(assessment, score_code)
+
+form_use_summary <- questionnaires |>
+  count(assessment, administered_form, name = "n_questionnaires") |>
+  arrange(assessment, administered_form)
+```
+
+## Validation
+
+```{r}
+#| label: validate-score-calculation
+stopifnot(
+  nrow(c30_score_item_crosswalk) == 30L,
+  n_distinct(c30_score_item_crosswalk$score_code) == 15L,
+  nrow(c15_score_item_crosswalk) == 15L,
+  n_distinct(c15_score_item_crosswalk$score_code) == 10L,
+  all(
+    questionnaire_score_availability$n_scores_possible[
+      questionnaire_score_availability$assessment == "First contact"
+    ] == 15L
+  ),
+  all(
+    questionnaire_score_availability$n_scores_possible[
+      questionnaire_score_availability$assessment == "Follow-up"
+    ] == 10L
+  ),
+  nrow(questionnaire_score_availability) == nrow(questionnaires),
+  all(
+    is.na(score_values_long$score_value) |
+      (score_values_long$score_value >= 0 & score_values_long$score_value <= 100)
+  ),
+  all(
+    score_values_long$computable ==
+      (score_values_long$n_items_answered >= score_values_long$n_items_required)
+  )
+)
+
+all_missing_questionnaire_keys <- questionnaires |>
+  filter(n_items_answered == 0) |>
+  pull(questionnaire_key)
+
+stopifnot(
+  all(
+    questionnaire_score_availability$n_scores_calculated[
+      questionnaire_score_availability$questionnaire_key %in%
+        all_missing_questionnaire_keys
+    ] == 0L
+  )
+)
+
+c15_shortened_scores <- score_values_long |>
+  filter(
+    scoring_rule == "QLQ-C15-PAL",
+    score_code %in% c("PF2", "EF", "FA", "NV")
+  )
+
+stopifnot(
+  all(
+    c15_shortened_scores$computable ==
+      (c15_shortened_scores$n_items_answered ==
+        c15_shortened_scores$n_items_total)
+  )
+)
+```
+
+## Saved Outputs
+
+```{r}
+#| label: save-score-outputs
+write_parquet(
+  score_values_long,
+  here(output_dir, "score_values_long.parquet")
+)
+write_parquet(
+  score_values_wide,
+  here(output_dir, "score_values_wide.parquet")
+)
+write_parquet(
+  questionnaire_score_availability,
+  here(output_dir, "questionnaire_score_availability.parquet")
+)
+write_parquet(
+  score_availability_summary,
+  here(output_dir, "score_availability_summary.parquet")
+)
+write_parquet(
+  score_availability_by_measure,
+  here(output_dir, "score_availability_by_measure.parquet")
+)
+```
+
+## Summary Results
+
+```{r}
+#| label: tbl-score-availability-summary
+#| tbl-cap: "Availability of EORTC scores at first contact and during follow-up."
+score_availability_display <- score_availability_summary |>
+  mutate(
+    Assessment = as.character(assessment),
+    Questionnaires = n_questionnaires,
+    `Scores calculated, mean/max (%)` = paste0(
+      number(mean_scores_calculated, accuracy = 0.1),
+      "/",
+      n_scores_possible,
+      " (",
+      percent(mean_prop_scores_calculated, accuracy = 0.1),
+      ")"
+    ),
+    `All scores calculated, n (%)` = paste0(
+      n_all_scores_calculated,
+      " (",
+      percent(prop_all_scores_calculated, accuracy = 0.1),
+      ")"
+    ),
+    `No scores calculated, n (%)` = paste0(
+      n_no_scores_calculated,
+      " (",
+      percent(prop_no_scores_calculated, accuracy = 0.1),
+      ")"
+    )
+  ) |>
+  select(
+    Assessment,
+    Questionnaires,
+    `Scores calculated, mean/max (%)`,
+    `All scores calculated, n (%)`,
+    `No scores calculated, n (%)`
+  )
+
+tt(score_availability_display)
+```
+
+```{r}
+#| label: tbl-score-availability-measure
+#| tbl-cap: "Availability of individual EORTC scores at first contact and during follow-up."
+score_availability_measure_display <- score_availability_by_measure |>
+  mutate(
+    Assessment = as.character(assessment),
+    Score = score_code,
+    Measure = score_label,
+    `Calculated, n (%)` = paste0(
+      n_scores_calculated,
+      " (",
+      percent(prop_scores_calculated, accuracy = 0.1),
+      ")"
+    )
+  ) |>
+  select(Assessment, Score, Measure, `Calculated, n (%)`)
+
+tt(score_availability_measure_display)
+```
+
+## Form Use Check
+
+This internal check shows which questionnaire form was administered at each assessment. It does not change the assessment-specific scoring rules.
+
+```{r}
+#| label: tbl-form-use-check
+tt(form_use_summary)
+```

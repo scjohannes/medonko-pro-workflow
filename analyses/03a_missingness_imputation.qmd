@@ -1,0 +1,254 @@
+---
+title: "Missingness Imputation"
+author: "Johannes Schwenke"
+date: today
+format:
+  typst: default
+---
+
+## Overview
+
+This document creates the analysis-specific multiple-imputation objects for the missingness analyses.
+
+```{r}
+#| label: setup
+library(here)
+library(arrow)
+library(mice)
+library(tidyverse)
+library(tinytable)
+
+source(here("R", "io.R"))
+
+followup_limit_days <- 182L
+
+ensure_dir(here("output", "03_imputation"))
+```
+
+```{r}
+#| label: load-data
+patients <- read_parquet(here("output", "derived", "patients_baseline.parquet"))
+raw_data <- read_parquet(here("data", "clean", "analysis_data_long_2026-08-11.parquet"))
+questionnaires <- read_parquet(here("output", "derived", "questionnaires.parquet")) |>
+  filter(
+    !is.na(days_since_first_contact),
+    days_since_first_contact >= 0,
+    days_since_first_contact <= followup_limit_days
+  )
+items <- read_parquet(here("output", "derived", "questionnaire_items_long.parquet")) |>
+  filter(
+    !is.na(days_since_first_contact),
+    days_since_first_contact >= 0,
+    days_since_first_contact <= followup_limit_days
+  )
+```
+
+```{r}
+#| label: build-mi-data
+questionnaire_summaries <- questionnaires |>
+  summarise(
+    n_questionnaires = dplyr::n(),
+    mean_prop_missing_nonstructural = mean(prop_missing_nonstructural),
+    max_prop_missing_nonstructural = max(prop_missing_nonstructural),
+    mean_n_missing_nonstructural = mean(n_items_missing_nonstructural),
+    mean_n_terminal_missing = mean(n_terminal_missing),
+    any_short_version = any(form_type == "short_version"),
+    mean_days_since_first_contact = mean(days_since_first_contact),
+    max_days_since_first_contact = max(days_since_first_contact),
+    .by = "pat_id"
+  )
+
+appointment_summaries <- raw_data |>
+  filter(
+    !is.na(days_since_fstcnt),
+    days_since_fstcnt >= 0,
+    days_since_fstcnt <= followup_limit_days
+  ) |>
+  count(pat_id, name = "n_appointments")
+
+mi_data <- patients |>
+  select(-n_questionnaires, -n_appointments, -ecog_baseline) |>
+  rename(ecog_baseline = ecog_baseline_analysis) |>
+  left_join(questionnaire_summaries, by = "pat_id") |>
+  left_join(appointment_summaries, by = "pat_id") |>
+  mutate(
+    n_questionnaires = tidyr::replace_na(n_questionnaires, 0L),
+    n_appointments = tidyr::replace_na(n_appointments, 0L),
+    any_short_version = tidyr::replace_na(any_short_version, FALSE),
+    across(
+      c(
+        "mean_prop_missing_nonstructural",
+        "max_prop_missing_nonstructural",
+        "mean_n_missing_nonstructural",
+        "mean_n_terminal_missing",
+        "mean_days_since_first_contact",
+        "max_days_since_first_contact"
+      ),
+      ~ tidyr::replace_na(.x, 0)
+    ),
+    treatment_plan_group = if_else(treatment_plan_group == "Missing", NA_character_, treatment_plan_group),
+    diagnosis_group = if_else(diagnosis_group == "Missing", NA_character_, diagnosis_group)
+  ) |> 
+  select(-diagnosis, -treatment_plan)
+```
+
+```{r}
+#| label: run-imputation
+mi_ready <- mi_data |>
+  mutate(
+    ecog_baseline = ordered(ecog_baseline),
+    sex = factor(sex),
+    reminder = factor(reminder),
+    treatment_plan_group = factor(treatment_plan_group),
+    diagnosis_group = factor(diagnosis_group)
+  )
+
+methods <- mice::make.method(mi_ready)
+predictor_matrix <- mice::quickpred(mi_ready, mincor = 0.05, minpuc = 0.25)
+predictor_matrix[, "pat_id"] <- 0
+
+methods[c(
+  "pat_id", "age", "sex", "language", "marital_status", "reminder",
+  "n_questionnaires", "n_appointments",
+  "mean_prop_missing_nonstructural", "max_prop_missing_nonstructural",
+  "mean_n_missing_nonstructural", "mean_n_terminal_missing",
+  "any_short_version", "mean_days_since_first_contact",
+  "max_days_since_first_contact"
+)] <- ""
+
+methods["ecog_baseline"] <- "polr"
+methods["diagnosis_group"] <- "polyreg"
+methods["treatment_plan_group"] <- "polyreg"
+
+mids_missingness <- mice::mice(
+  data = mi_ready,
+  m = 10,
+  maxit = 20,
+  method = methods,
+  predictorMatrix = predictor_matrix,
+  seed = 20260228,
+  printFlag = FALSE
+)
+```
+
+```{r}
+#| label: complete-imputed-datasets
+patient_sets <- mice::complete(mids_missingness, action = "all")
+
+questionnaires_imputed <- vector("list", length(patient_sets))
+questionnaire_items_imputed <- vector("list", length(patient_sets))
+
+for (i in seq_along(patient_sets)) {
+  completed_patients <- patient_sets[[i]]
+
+  questionnaires_imputed[[i]] <- questionnaires |>
+    select(
+      -tidyselect::any_of(c("ecog_baseline", "diagnosis_group", "treatment_plan_group"))
+    ) |>
+    left_join(
+      completed_patients |>
+        select(
+          pat_id,
+          ecog_baseline,
+          diagnosis_group,
+          treatment_plan_group
+        ),
+      by = "pat_id"
+    ) |>
+    mutate(
+      ecog_baseline = ordered(ecog_baseline),
+      diagnosis_group = factor(diagnosis_group),
+      treatment_plan_group = factor(treatment_plan_group),
+      sex = factor(sex),
+      reminder = factor(reminder),
+      form_type = factor(form_type)
+    )
+
+  questionnaire_items_imputed[[i]] <- items |>
+    select(
+      -tidyselect::any_of(c("ecog_baseline", "diagnosis_group", "treatment_plan_group"))
+    ) |>
+    left_join(
+      completed_patients |>
+        select(
+          pat_id,
+          ecog_baseline,
+          diagnosis_group,
+          treatment_plan_group
+        ),
+      by = "pat_id"
+    ) |>
+    mutate(
+      ecog_baseline = ordered(ecog_baseline),
+      diagnosis_group = factor(diagnosis_group),
+      treatment_plan_group = factor(treatment_plan_group),
+      sex = factor(sex),
+      reminder = factor(reminder),
+      form_type = factor(form_type)
+    )
+}
+
+completed_sets <- list(
+  patients = patient_sets,
+  questionnaires = questionnaires_imputed,
+  questionnaire_items = questionnaire_items_imputed
+)
+
+saveRDS(mids_missingness, here("output", "03_imputation", "mids_missingness.rds"))
+saveRDS(completed_sets$questionnaires, here("output", "03_imputation", "questionnaires_imputed_list.rds"))
+saveRDS(completed_sets$questionnaire_items, here("output", "03_imputation", "questionnaire_items_imputed_list.rds"))
+
+# brms can read the mids object directly via brm_multiple(); no additional
+# conversion is needed — saving mids_missingness.rds above is sufficient.
+```
+
+### Convergence
+
+Trace plots of the per-chain mean and SD over iterations. Chains should mix well
+and show no systematic trend.
+
+```{r}
+#| label: diag-trace
+#| fig-width: 8
+#| fig-height: 5
+plot(mids_missingness)
+```
+
+### Density plots
+
+Observed (blue) vs. imputed (red) marginal distributions for the continuous /
+ordinal target variables.
+
+```{r}
+#| label: diag-density-ecog
+#| fig-width: 6
+#| fig-height: 4
+densityplot(mids_missingness, ~ ecog_baseline,
+  xlab = "ECOG baseline (as integer)"
+)
+```
+
+### Strip plots
+
+Strip plots show every observed (blue) and imputed (red) value for the
+categorical variables, jittered across the  imputed datasets.
+
+```{r}
+#| label: diag-strip-diagnosis
+#| fig-width: 7
+#| fig-height: 4
+stripplot(mids_missingness, diagnosis_group ~ .imp,
+  xlab = "Imputation index",
+  ylab = "Diagnosis group"
+)
+```
+
+```{r}
+#| label: diag-strip-treatment
+#| fig-width: 7
+#| fig-height: 4
+stripplot(mids_missingness, treatment_plan_group ~ .imp,
+  xlab = "Imputation index",
+  ylab = "Treatment plan group"
+)
+```
