@@ -1,8 +1,18 @@
 # medonko-pro-workflow
 
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.23045195.svg)](https://doi.org/10.5281/zenodo.23045195)
+
 Analysis code for the manuscript *Patient-Reported Outcomes Workflow and Missingness in Routine Oncological Care* (Schwenke et al., 2026).
 
 The study describes the routine, REDCap-based collection of EORTC patient-reported outcome (PRO) questionnaires in the medical oncology outpatient clinic of the University Hospital Basel, Switzerland. It covers questionnaire handout rates, the effect of reminders to reception staff, item-level missingness, EORTC score availability, survey completion time, and a survey of clinical staff.
+
+## Citation
+
+The version of the code used for the manuscript is archived on Zenodo:
+
+> Schwenke JM (2026) medonko-pro-workflow: Analysis code for Patient-Reported Outcomes Workflow and Missingness in Routine Oncological Care (version v1.0.0). Zenodo. https://doi.org/10.5281/zenodo.23045195
+
+To cite the latest version of the code instead, use the concept DOI [10.5281/zenodo.23045194](https://doi.org/10.5281/zenodo.23045194).
 
 ## Data availability
 
